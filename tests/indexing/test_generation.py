@@ -1,6 +1,6 @@
 import json
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import FrozenInstanceError, asdict, replace
 from pathlib import Path
 from threading import Barrier
 
@@ -64,6 +64,112 @@ def test_stale_compare_and_swap_preserves_current_active(tmp_path: Path) -> None
     assert catalog.read_active() == active
     assert next_generation.state is GenerationState.VALIDATED
     assert not catalog.temp_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("document_version", "doc-v2"),
+        ("source_hash", "e" * 64),
+        ("schema_version", "evidence-region.v2"),
+        ("acl_projection_version", 5),
+        ("text", "e" * 64),
+        ("structure", "e" * 64),
+        ("visual", "e" * 64),
+        ("text", 4),
+    ],
+)
+def test_active_generation_id_cannot_be_reused_for_different_content(
+    tmp_path: Path, field: str, value: str | int
+) -> None:
+    path = tmp_path / "catalog.json"
+    catalog = JsonGenerationCatalog(path)
+    generation = candidate("gen_01")
+    active = catalog.promote(generation, expected_active_id=None)
+    original_catalog = path.read_bytes()
+
+    if any(manifest.kind == field for manifest in generation.manifests):
+        change = {"row_count" if isinstance(value, int) else "sha256": value}
+        altered = replace(
+            generation,
+            manifests=tuple(
+                replace(manifest, **change) if manifest.kind == field else manifest
+                for manifest in generation.manifests
+            ),
+        )
+    else:
+        altered = replace(generation, **{field: value})
+
+    with pytest.raises(RaglabError) as raised:
+        catalog.promote(altered, expected_active_id="gen_01")
+
+    assert raised.value.code is ErrorCode.GENERATION_CONFLICT
+    assert path.read_bytes() == original_catalog
+    assert catalog.read_active() == active
+    assert altered.state is GenerationState.VALIDATED
+    assert not catalog.temp_path.exists()
+
+
+def test_identical_active_generation_promotion_is_a_no_op(tmp_path: Path) -> None:
+    path = tmp_path / "catalog.json"
+    catalog = JsonGenerationCatalog(path)
+    generation = candidate("gen_01")
+    active = catalog.promote(generation, expected_active_id=None)
+    catalog.temp_path.write_text("partial", encoding="utf-8")
+
+    assert catalog.promote(generation, expected_active_id="gen_01") == active
+    assert catalog.temp_path.read_text(encoding="utf-8") == "partial"
+    with pytest.raises(RaglabError) as raised:
+        catalog.promote(generation, expected_active_id=None)
+    assert raised.value.code is ErrorCode.GENERATION_CONFLICT
+
+
+@pytest.mark.parametrize("source_digit", ["d", "e"], ids=["identical", "different"])
+def test_retired_generation_id_cannot_be_reused_after_reopening(
+    tmp_path: Path, source_digit: str
+) -> None:
+    path = tmp_path / "catalog.json"
+    catalog = JsonGenerationCatalog(path)
+    catalog.promote(candidate("gen_01"), expected_active_id=None)
+    active = catalog.promote(candidate("gen_02"), expected_active_id="gen_01")
+    original_catalog = path.read_bytes()
+    reopened = JsonGenerationCatalog(path)
+    retired_id = replace(candidate("gen_01"), source_hash=source_digit * 64)
+
+    with pytest.raises(RaglabError) as raised:
+        reopened.promote(retired_id, expected_active_id="gen_02")
+
+    assert raised.value.code is ErrorCode.GENERATION_CONFLICT
+    assert path.read_bytes() == original_catalog
+    assert reopened.read_active() == active
+
+
+def test_promoting_from_a_legacy_catalog_reserves_its_active_id(tmp_path: Path) -> None:
+    path = tmp_path / "catalog.json"
+    original = candidate("gen_01")
+    active = replace(original, state=GenerationState.ACTIVE)
+    path.write_text(json.dumps(asdict(active)), encoding="utf-8")
+    catalog = JsonGenerationCatalog(path)
+
+    assert catalog.read_active() == active
+    current = catalog.promote(candidate("gen_02"), expected_active_id="gen_01")
+    with pytest.raises(RaglabError) as raised:
+        JsonGenerationCatalog(path).promote(original, expected_active_id="gen_02")
+
+    assert raised.value.code is ErrorCode.GENERATION_CONFLICT
+    assert catalog.read_active() == current
+
+
+def test_catalog_rejects_valid_metadata_that_differs_from_its_fingerprint(tmp_path: Path) -> None:
+    path = tmp_path / "catalog.json"
+    catalog = JsonGenerationCatalog(path)
+    catalog.promote(candidate("gen_01"), expected_active_id=None)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["source_hash"] = "e" * 64
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="fingerprint"):
+        catalog.read_active()
 
 
 def test_concurrent_promotions_have_only_one_winner(tmp_path: Path) -> None:

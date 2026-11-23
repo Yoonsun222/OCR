@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
+from hashlib import sha256
 from pathlib import Path
 from uuid import uuid4
 
@@ -18,6 +19,7 @@ else:
 
 _MANIFEST_KINDS = frozenset({"text", "structure", "visual"})
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+_FINGERPRINTS_FIELD = "generation_fingerprints"
 
 
 class GenerationState(StrEnum):
@@ -71,8 +73,13 @@ class IndexGeneration:
         object.__setattr__(self, "manifests", manifests)
 
 
+def _fingerprint(generation: IndexGeneration) -> str:
+    canonical_json = json.dumps(asdict(generation), sort_keys=True, separators=(",", ":"))
+    return sha256(canonical_json.encode("utf-8")).hexdigest()
+
+
 class JsonGenerationCatalog:
-    """Store one ACTIVE generation in an atomically replaced local JSON file."""
+    """Store the ACTIVE generation and ID history in one atomic JSON record."""
 
     def __init__(self, path: Path) -> None:
         self._path = path.absolute()
@@ -94,25 +101,41 @@ class JsonGenerationCatalog:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             yield
 
-    def _read_active(self) -> IndexGeneration | None:
+    def _read_record(self) -> tuple[IndexGeneration | None, dict[str, str]]:
         try:
             with self._path.open(encoding="utf-8") as catalog_file:
                 data = json.load(catalog_file)
         except FileNotFoundError:
-            return None
+            return None, {}
 
+        has_history = _FINGERPRINTS_FIELD in data
+        fingerprints = data.pop(_FINGERPRINTS_FIELD, None)
         state = GenerationState(data["state"])
         if state is not GenerationState.ACTIVE:
             raise ValueError("catalog must contain an ACTIVE generation")
         data["state"] = state
         data["manifests"] = tuple(IndexManifest(**manifest) for manifest in data["manifests"])
-        return IndexGeneration(**data)
+        active = IndexGeneration(**data)
+        fingerprint = _fingerprint(active)
+        if not has_history:
+            return active, {active.generation_id: fingerprint}
+        if not isinstance(fingerprints, dict) or any(
+            not generation_id.strip()
+            or not isinstance(digest, str)
+            or _SHA256.fullmatch(digest) is None
+            for generation_id, digest in fingerprints.items()
+        ):
+            raise ValueError("catalog generation fingerprint history is invalid")
+        if fingerprints.get(active.generation_id) != fingerprint:
+            raise ValueError("catalog ACTIVE generation does not match its fingerprint")
+        return active, fingerprints
 
     def read_active(self) -> IndexGeneration | None:
         if not self._path.exists():
             return None
         with self._locked():
-            return self._read_active()
+            active, _ = self._read_record()
+            return active
 
     def promote(
         self, candidate: IndexGeneration, expected_active_id: str | None
@@ -121,7 +144,7 @@ class JsonGenerationCatalog:
             raise ValueError("only a VALIDATED generation may be promoted")
 
         with self._locked():
-            current = self._read_active()
+            current, fingerprints = self._read_record()
             current_id = current.generation_id if current is not None else None
             if current_id != expected_active_id:
                 raise RaglabError(
@@ -136,9 +159,26 @@ class JsonGenerationCatalog:
                 )
 
             active = replace(candidate, state=GenerationState.ACTIVE)
+            if current is not None and current == active:
+                return current
+            if active.generation_id in fingerprints:
+                raise RaglabError(
+                    code=ErrorCode.GENERATION_CONFLICT,
+                    stage="promote",
+                    observed="generation identifier is already bound",
+                    expected="unused generation identifier",
+                    protected_state="active catalog unchanged",
+                    retry=RetryAdvice.NEVER,
+                    next_action="build the candidate with a new generation identifier",
+                    diagnostic_id=uuid4().hex,
+                )
+
+            fingerprints[active.generation_id] = _fingerprint(active)
+            record = asdict(active)
+            record[_FINGERPRINTS_FIELD] = fingerprints
             self.temp_path.unlink(missing_ok=True)
             with self.temp_path.open("x", encoding="utf-8") as temp_file:
-                json.dump(asdict(active), temp_file)
+                json.dump(record, temp_file)
                 temp_file.flush()
                 os.fsync(temp_file.fileno())
             os.replace(self.temp_path, self._path)

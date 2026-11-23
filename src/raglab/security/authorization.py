@@ -1,4 +1,4 @@
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from threading import Lock
 from types import MappingProxyType
@@ -87,8 +87,16 @@ class MemoryPolicyStore:
 
 
 class AuthorizationGuard:
-    def __init__(self, store: MemoryPolicyStore) -> None:
+    """Check policy and any injected document serving block at each request boundary."""
+
+    def __init__(
+        self,
+        store: MemoryPolicyStore,
+        *,
+        serving_blocked: Callable[[str], bool] | None = None,
+    ) -> None:
         self._store = store
+        self._serving_blocked = serving_blocked
 
     def pin(
         self,
@@ -99,8 +107,8 @@ class AuthorizationGuard:
         generation_id: str,
         diagnostic_id: str | None = None,
     ) -> QueryPin:
-        current = self._read(document_id, "pin", diagnostic_id)
-        if not current.allows(principal_id, group_hash):
+        current, blocked = self._read(document_id, "pin", diagnostic_id)
+        if blocked or not current.allows(principal_id, group_hash):
             raise RaglabError.policy_denied("pin", diagnostic_id or uuid4().hex)
         return QueryPin(
             principal_id=principal_id,
@@ -113,20 +121,29 @@ class AuthorizationGuard:
         )
 
     def check(self, pin: QueryPin, stage: str, diagnostic_id: str | None = None) -> None:
-        current = self._read(pin.document_id, stage, diagnostic_id)
-        if current.policy_epoch != pin.policy_epoch or not current.allows(
+        current, blocked = self._read(pin.document_id, stage, diagnostic_id)
+        if blocked or current.policy_epoch != pin.policy_epoch or not current.allows(
             pin.principal_id, pin.group_hash
         ):
             raise RaglabError(
                 ErrorCode.AUTHORIZATION_CHANGED, stage,
-                f"policy epoch {current.policy_epoch}", f"policy epoch {pin.policy_epoch}",
+                "document serving blocked" if blocked else f"policy epoch {current.policy_epoch}",
+                f"policy epoch {pin.policy_epoch}",
                 "partial results discarded", RetryAdvice.ONCE_FROM_FRESH_SNAPSHOT,
                 "restart authorization once", diagnostic_id or uuid4().hex,
             )
 
-    def _read(self, document_id: str, stage: str, diagnostic_id: str | None) -> PolicySnapshot:
+    def _read(
+        self, document_id: str, stage: str, diagnostic_id: str | None
+    ) -> tuple[PolicySnapshot, bool]:
         try:
-            return self._store.read(document_id)
+            current = self._store.read(document_id)
+            blocked = (
+                self._serving_blocked(document_id) if self._serving_blocked is not None else False
+            )
+            if type(blocked) is not bool:
+                raise ValueError("invalid serving decision")
+            return current, blocked
         except Exception:
             raise RaglabError(
                 code=ErrorCode.POLICY_UNAVAILABLE,

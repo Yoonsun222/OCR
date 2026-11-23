@@ -65,17 +65,48 @@ class DeletionReceipt:
 class MemoryDerivativeRegistry:
     def __init__(self) -> None:
         self._derivatives: dict[str, Derivative] = {}
+        self._owners: dict[tuple[str, str], str] = {}
+        self._publication_backends: dict[str, MemoryStorageBackend] = {}
         self._tombstones: set[str] = set()
         self._lock = Lock()
 
     def register(self, derivative: Derivative) -> None:
+        """Record existing lineage. Use publish when writing an object."""
         with self._lock:
-            if derivative.source_hash in self._tombstones:
-                raise ValueError("cannot register a derivative for a tombstoned source")
-            existing = self._derivatives.get(derivative.derivative_id)
-            if existing is not None and existing != derivative:
-                raise ValueError("derivative identifier is already bound")
-            self._derivatives[derivative.derivative_id] = derivative
+            self._register(derivative)
+
+    def publish(self, derivative: Derivative, backend: "MemoryStorageBackend") -> None:
+        """Record lineage and write the object in the same tombstone lock."""
+        if derivative.backend_name != backend.name:
+            raise ValueError("derivative backend does not match publication backend")
+        with self._lock:
+            if self._publication_backends.get(backend.name, backend) is not backend:
+                raise _registration_conflict(
+                    "backend name already belongs to a different storage instance",
+                    "one storage instance per backend name",
+                    "use the registered storage backend",
+                )
+            self._register(derivative)
+            self._publication_backends[backend.name] = backend
+            # Keep lineage if a storage failure leaves the write outcome uncertain.
+            backend._put(derivative.object_key)
+
+    def _register(self, derivative: Derivative) -> None:
+        if derivative.source_hash in self._tombstones:
+            raise ValueError("cannot register a derivative for a tombstoned source")
+        existing = self._derivatives.get(derivative.derivative_id)
+        if existing is not None and existing != derivative:
+            raise ValueError("derivative identifier is already bound")
+        location = (derivative.backend_name, derivative.object_key)
+        owner = self._owners.get(location)
+        if owner is not None and owner != derivative.derivative_id:
+            raise _registration_conflict(
+                "storage object already belongs to a different derivative",
+                "one derivative owner per storage object",
+                "choose a distinct storage object key",
+            )
+        self._derivatives[derivative.derivative_id] = derivative
+        self._owners[location] = derivative.derivative_id
 
     def tombstone(self, source_hash: str) -> None:
         with self._lock:
@@ -92,15 +123,23 @@ class MemoryDerivativeRegistry:
                 if derivative.source_hash == source_hash
             )
 
+    def matches_backend(self, name: str, backend: "MemoryStorageBackend") -> bool:
+        with self._lock:
+            return backend.name == name and self._publication_backends.get(name, backend) is backend
+
 
 class MemoryStorageBackend:
     def __init__(self, name: str, retention_locked: bool = False) -> None:
-        self.name = name
+        self._name = name
         self.retention_locked = retention_locked
         self._object_keys: set[str] = set()
         self._lock = Lock()
 
-    def put(self, object_key: str) -> None:
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def _put(self, object_key: str) -> None:
         with self._lock:
             self._object_keys.add(object_key)
 
@@ -135,6 +174,8 @@ class DeletionCoordinator:
             backend = self._backends.get(derivative.backend_name)
             if backend is None:
                 raise _verification_failed(deletion_job_id, "required storage backend unavailable")
+            if not self._registry.matches_backend(derivative.backend_name, backend):
+                raise _verification_failed(deletion_job_id, "storage backend does not match lineage")
             try:
                 operation = backend.delete(derivative.object_key)
             except Exception:
@@ -181,6 +222,19 @@ class DeletionCoordinator:
             verifier_version="deletion.v1",
             status=status,
         )
+
+
+def _registration_conflict(observed: str, expected: str, next_action: str) -> RaglabError:
+    return RaglabError(
+        code=ErrorCode.DELETION_VERIFICATION_FAILED,
+        stage="register_derivative",
+        observed=observed,
+        expected=expected,
+        protected_state="registry unchanged",
+        retry=RetryAdvice.NEVER,
+        next_action=next_action,
+        diagnostic_id=uuid4().hex,
+    )
 
 
 def _verification_failed(deletion_job_id: str, observed: str) -> RaglabError:

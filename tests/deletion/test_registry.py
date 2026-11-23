@@ -1,5 +1,7 @@
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
 from datetime import UTC
+from threading import Event
 
 import pytest
 
@@ -12,6 +14,7 @@ from raglab.deletion.registry import (
     MemoryDerivativeRegistry,
     MemoryStorageBackend,
 )
+from raglab.security.authorization import AuthorizationGuard, MemoryPolicyStore
 
 
 SOURCE_HASH = "s" * 64
@@ -30,8 +33,7 @@ def test_delete_tombstones_before_backend_removal_and_verifies_absence() -> None
         "der_01", SOURCE_HASH, "doc-v1", "gen_01",
         DerivativeKind.INDEX_POSTING, backend.name, "opaque/object/01", None,
     )
-    registry.register(derivative)
-    backend.put(derivative.object_key)
+    registry.publish(derivative, backend)
 
     receipt = DeletionCoordinator(registry, {backend.name: backend}).delete_document(SOURCE_HASH)
 
@@ -49,8 +51,7 @@ def test_retained_backup_never_reports_deleted_verified() -> None:
         "der_02", SOURCE_HASH, "doc-v1", "gen_01",
         DerivativeKind.BACKUP_REFERENCE, backup.name, "opaque/backup/02", None,
     )
-    registry.register(derivative)
-    backup.put(derivative.object_key)
+    registry.publish(derivative, backup)
     coordinator = DeletionCoordinator(registry, {backup.name: backup})
 
     receipt = coordinator.delete_document(SOURCE_HASH)
@@ -91,13 +92,11 @@ def test_receipt_freezes_sorted_lineage_and_records_fresh_verification() -> None
             derivative_id, SOURCE_HASH, "doc-v1", "gen_01",
             kind, backend.name, f"opaque/{derivative_id}", None,
         )
-        registry.register(derivative)
-        backend.put(derivative.object_key)
+        registry.publish(derivative, backend)
     unrelated = replace(
         derivative, derivative_id="der_03", source_hash="t" * 64, object_key="opaque/der_03"
     )
-    registry.register(unrelated)
-    backend.put(unrelated.object_key)
+    registry.publish(unrelated, backend)
     coordinator = DeletionCoordinator(registry, {backend.name: backend})
 
     receipt = coordinator.delete_document(SOURCE_HASH)
@@ -167,14 +166,236 @@ def test_unverifiable_backend_results_raise_typed_error(
 
     registry = MemoryDerivativeRegistry()
     backend = UnverifiableBackend("local", retention_locked=retention_locked)
-    registry.register(Derivative(
+    registry.publish(Derivative(
         "der_01", SOURCE_HASH, "doc-v1", "gen_01",
         DerivativeKind.INDEX_POSTING, backend.name, "opaque/object/01", None,
-    ))
-    backend.put("opaque/object/01")
+    ), backend)
 
     with pytest.raises(RaglabError) as caught:
         DeletionCoordinator(registry, {backend.name: backend}).delete_document(SOURCE_HASH)
 
     assert caught.value.code is ErrorCode.DELETION_VERIFICATION_FAILED
     assert registry.is_tombstoned(SOURCE_HASH)
+
+
+@pytest.mark.parametrize("backend_fails", [False, True])
+def test_tombstone_blocks_serving_before_backend_operations(backend_fails: bool) -> None:
+    registry = MemoryDerivativeRegistry()
+    store = MemoryPolicyStore()
+    store.allow("user_01", "doc_01", group_hash="g" * 64)
+    sources = {"doc_01": SOURCE_HASH}
+    guard = AuthorizationGuard(
+        store, serving_blocked=lambda document_id: registry.is_tombstoned(sources[document_id])
+    )
+    pin = guard.pin("user_01", "g" * 64, "doc_01", "doc-v1", "gen_01")
+    guard.check(pin, "serialize")
+
+    class CheckingBackend(MemoryStorageBackend):
+        def delete(self, object_key: str):
+            with pytest.raises(RaglabError) as caught:
+                guard.check(pin, "source_load")
+            assert caught.value.code is ErrorCode.AUTHORIZATION_CHANGED
+            if backend_fails:
+                raise OSError("synthetic backend failure")
+            return super().delete(object_key)
+
+    backend = CheckingBackend("local")
+    derivative = Derivative(
+        "der_01", SOURCE_HASH, "doc-v1", "gen_01",
+        DerivativeKind.ORIGINAL_COPY, backend.name, "opaque/object/01",
+    )
+    registry.publish(derivative, backend)
+    coordinator = DeletionCoordinator(registry, {backend.name: backend})
+
+    if backend_fails:
+        with pytest.raises(RaglabError) as caught:
+            coordinator.delete_document(SOURCE_HASH)
+        assert caught.value.code is ErrorCode.DELETION_VERIFICATION_FAILED
+        assert backend.exists(derivative.object_key)
+    else:
+        assert coordinator.delete_document(SOURCE_HASH).status is DeletionStatus.DELETED_VERIFIED
+
+    with pytest.raises(RaglabError) as caught:
+        guard.check(pin, "serialize")
+    assert caught.value.code is ErrorCode.AUTHORIZATION_CHANGED
+    with pytest.raises(RaglabError) as caught:
+        guard.pin("user_01", "g" * 64, "doc_01", "doc-v1", "gen_01")
+    assert caught.value.code is ErrorCode.POLICY_DENIED
+
+
+def test_unavailable_serving_blocker_fails_closed() -> None:
+    store = MemoryPolicyStore()
+    store.allow("user_01", "doc_01", group_hash="g" * 64)
+    original_guard = AuthorizationGuard(store)
+    pin = original_guard.pin("user_01", "g" * 64, "doc_01", "doc-v1", "gen_01")
+
+    def unavailable(_document_id: str) -> bool:
+        raise OSError("synthetic tombstone lookup failure")
+
+    guard = AuthorizationGuard(store, serving_blocked=unavailable)
+    with pytest.raises(RaglabError) as caught:
+        guard.check(pin, "serialize")
+    assert caught.value.code is ErrorCode.POLICY_UNAVAILABLE
+    with pytest.raises(RaglabError) as caught:
+        guard.pin("user_01", "g" * 64, "doc_01", "doc-v1", "gen_01")
+    assert caught.value.code is ErrorCode.POLICY_UNAVAILABLE
+
+
+def test_publication_winning_the_tombstone_race_is_deleted() -> None:
+    writing = Event()
+    deleting = Event()
+    finish_write = Event()
+
+    class SynchronizedRegistry(MemoryDerivativeRegistry):
+        def tombstone(self, source_hash: str) -> None:
+            deleting.set()
+            super().tombstone(source_hash)
+
+    registry = SynchronizedRegistry()
+
+    class PausedBackend(MemoryStorageBackend):
+        def _put(self, object_key: str) -> None:
+            assert registry._lock.locked()
+            writing.set()
+            assert finish_write.wait(5)
+            super()._put(object_key)
+
+    backend = PausedBackend("local")
+    derivative = Derivative(
+        "der_01", SOURCE_HASH, "doc-v1", "gen_01",
+        DerivativeKind.ORIGINAL_COPY, backend.name, "opaque/object/01",
+    )
+    coordinator = DeletionCoordinator(registry, {backend.name: backend})
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        publication = executor.submit(registry.publish, derivative, backend)
+        try:
+            assert writing.wait(5)
+            deletion = executor.submit(coordinator.delete_document, SOURCE_HASH)
+            assert deleting.wait(5)
+        finally:
+            finish_write.set()
+        publication.result(timeout=5)
+        receipt = deletion.result(timeout=5)
+
+    assert receipt.expected_derivatives == ("der_01",)
+    assert receipt.status is DeletionStatus.DELETED_VERIFIED
+    assert not backend.exists(derivative.object_key)
+
+
+def test_tombstone_winning_the_publication_race_prevents_storage_write() -> None:
+    tombstoned = Event()
+    finish_deletion = Event()
+
+    class PausedRegistry(MemoryDerivativeRegistry):
+        def derivatives_for(self, source_hash: str) -> tuple[Derivative, ...]:
+            tombstoned.set()
+            assert finish_deletion.wait(5)
+            return super().derivatives_for(source_hash)
+
+    registry = PausedRegistry()
+    backend = MemoryStorageBackend("local")
+    derivative = Derivative(
+        "der_01", SOURCE_HASH, "doc-v1", "gen_01",
+        DerivativeKind.ORIGINAL_COPY, backend.name, "opaque/object/01",
+    )
+    coordinator = DeletionCoordinator(registry, {backend.name: backend})
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        deletion = executor.submit(coordinator.delete_document, SOURCE_HASH)
+        try:
+            assert tombstoned.wait(5)
+            with pytest.raises(ValueError, match="tombstoned"):
+                registry.publish(derivative, backend)
+        finally:
+            finish_deletion.set()
+        receipt = deletion.result(timeout=5)
+
+    assert receipt.expected_derivatives == ()
+    assert receipt.status is DeletionStatus.DELETED_VERIFIED
+    with pytest.raises(ValueError, match="tombstoned"):
+        registry.publish(derivative, backend)
+    assert not backend.exists(derivative.object_key)
+
+
+@pytest.mark.parametrize("source_hash", [SOURCE_HASH, "t" * 64])
+def test_object_key_cannot_be_rebound_to_another_derivative(source_hash: str) -> None:
+    registry = MemoryDerivativeRegistry()
+    derivative = Derivative(
+        "der_01", SOURCE_HASH, "doc-v1", "gen_01",
+        DerivativeKind.ORIGINAL_COPY, "local", "opaque/object/01",
+    )
+    registry.register(derivative)
+    conflicting = replace(derivative, derivative_id="der_02", source_hash=source_hash)
+
+    with pytest.raises(RaglabError) as caught:
+        registry.register(conflicting)
+
+    assert caught.value.code is ErrorCode.DELETION_VERIFICATION_FAILED
+    assert conflicting.object_key not in str(caught.value.to_safe_dict())
+    assert registry.derivatives_for(SOURCE_HASH) == (derivative,)
+
+
+def test_mixed_deletion_receipt_identifies_which_derivative_remains() -> None:
+    registry = MemoryDerivativeRegistry()
+    local = MemoryStorageBackend("local")
+    backup = MemoryStorageBackend("backup", retention_locked=True)
+    for derivative_id, kind, backend in [
+        ("der_01", DerivativeKind.ORIGINAL_COPY, local),
+        ("der_02", DerivativeKind.BACKUP_REFERENCE, backup),
+    ]:
+        derivative = Derivative(
+            derivative_id, SOURCE_HASH, "doc-v1", "gen_01",
+            kind, backend.name, f"opaque/{derivative_id}",
+        )
+        registry.publish(derivative, backend)
+
+    receipt = DeletionCoordinator(
+        registry, {local.name: local, backup.name: backup}
+    ).delete_document(SOURCE_HASH)
+
+    assert receipt.status is DeletionStatus.DELETION_PENDING_RETENTION
+    assert receipt.deleted_count == 1
+    assert receipt.expected_derivatives == ("der_01", "der_02")
+    assert receipt.negative_lookup_results == {"der_01": True, "der_02": False}
+    assert set(receipt.backend_operation_ids) == {"der_01", "der_02"}
+
+
+def test_same_name_backend_cannot_verify_another_instances_publication() -> None:
+    registry = MemoryDerivativeRegistry()
+    backend = MemoryStorageBackend("local")
+    same_name = MemoryStorageBackend(backend.name)
+    derivative = Derivative(
+        "der_01", SOURCE_HASH, "doc-v1", "gen_01",
+        DerivativeKind.ORIGINAL_COPY, backend.name, "opaque/object/01",
+    )
+    registry.publish(derivative, backend)
+
+    with pytest.raises(RaglabError) as caught:
+        DeletionCoordinator(registry, {same_name.name: same_name}).delete_document(SOURCE_HASH)
+
+    assert caught.value.code is ErrorCode.DELETION_VERIFICATION_FAILED
+    assert registry.is_tombstoned(SOURCE_HASH)
+    assert backend.exists(derivative.object_key)
+    receipt = DeletionCoordinator(registry, {backend.name: backend}).delete_document(SOURCE_HASH)
+    assert receipt.status is DeletionStatus.DELETED_VERIFIED
+    assert not backend.exists(derivative.object_key)
+
+
+def test_same_name_backend_cannot_publish_into_a_second_store() -> None:
+    registry = MemoryDerivativeRegistry()
+    backend = MemoryStorageBackend("local")
+    same_name = MemoryStorageBackend(backend.name)
+    derivative = Derivative(
+        "der_01", SOURCE_HASH, "doc-v1", "gen_01",
+        DerivativeKind.ORIGINAL_COPY, backend.name, "opaque/object/01",
+    )
+    registry.publish(derivative, backend)
+    second = replace(derivative, derivative_id="der_02", object_key="opaque/object/02")
+
+    with pytest.raises(RaglabError) as caught:
+        registry.publish(second, same_name)
+
+    assert caught.value.code is ErrorCode.DELETION_VERIFICATION_FAILED
+    assert registry.derivatives_for(SOURCE_HASH) == (derivative,)
+    assert not same_name.exists(second.object_key)

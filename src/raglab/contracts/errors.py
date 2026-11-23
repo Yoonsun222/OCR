@@ -1,5 +1,5 @@
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import FrozenInstanceError, dataclass, field
 from enum import StrEnum
 
 
@@ -20,7 +20,12 @@ class RetryAdvice(StrEnum):
     ONCE_FROM_FRESH_SNAPSHOT = "ONCE_FROM_FRESH_SNAPSHOT"
 
 
-@dataclass(frozen=True, slots=True)
+_EXCEPTION_METADATA = frozenset(
+    {"__cause__", "__context__", "__notes__", "__suppress_context__", "__traceback__"}
+)
+
+
+@dataclass(slots=True, unsafe_hash=True)
 class RaglabError(Exception):
     code: ErrorCode
     stage: str
@@ -33,6 +38,21 @@ class RaglabError(Exception):
     sensitive_context: Mapping[str, str] = field(
         default_factory=dict, repr=False, compare=False, hash=False
     )
+
+    def __setattr__(self, name: str, value: object) -> None:
+        # Dataclass construction writes each slot once. Python may update
+        # exception metadata throughout the exception's lifetime.
+        uninitialized_slot = name in RaglabError.__slots__ and not hasattr(self, name)
+        if uninitialized_slot or name in _EXCEPTION_METADATA:
+            Exception.__setattr__(self, name, value)
+            return
+        raise FrozenInstanceError(f"cannot assign to field {name!r}")
+
+    def __delattr__(self, name: str) -> None:
+        if name in _EXCEPTION_METADATA:
+            Exception.__delattr__(self, name)
+            return
+        raise FrozenInstanceError(f"cannot delete field {name!r}")
 
     def __post_init__(self) -> None:
         # Exception normally retains positional arguments for its string form.

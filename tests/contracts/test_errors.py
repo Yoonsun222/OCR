@@ -1,4 +1,8 @@
 import json
+from contextlib import contextmanager
+from dataclasses import FrozenInstanceError
+
+import pytest
 
 from raglab.contracts import ErrorCode, RaglabError, RetryAdvice
 
@@ -41,3 +45,24 @@ def test_policy_denied_fails_closed():
     assert error.protected_state == "no source or result released"
     assert error.retry is RetryAdvice.NEVER
     assert error.diagnostic_id == "diag-002"
+
+
+def test_raglab_error_keeps_exception_metadata_through_context_manager():
+    @contextmanager
+    def operation():
+        yield
+
+    error = RaglabError.policy_denied(stage="retrieve", diagnostic_id="diag-003")
+
+    with pytest.raises(RaglabError) as caught:
+        with operation():
+            raise error
+
+    assert caught.value is error
+    error.add_note("retry disabled")
+    assert error.__notes__ == ["retry disabled"]
+
+    with pytest.raises(FrozenInstanceError):
+        error.stage = "changed"
+    with pytest.raises(FrozenInstanceError):
+        del error.stage

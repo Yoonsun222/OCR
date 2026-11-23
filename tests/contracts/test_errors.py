@@ -37,6 +37,10 @@ def test_safe_error_output_excludes_sensitive_context():
 
 
 def test_policy_denied_fails_closed():
+    @contextmanager
+    def operation():
+        yield
+
     error = RaglabError.policy_denied(stage="retrieve", diagnostic_id="diag-002")
 
     assert isinstance(error, Exception)
@@ -45,14 +49,6 @@ def test_policy_denied_fails_closed():
     assert error.protected_state == "no source or result released"
     assert error.retry is RetryAdvice.NEVER
     assert error.diagnostic_id == "diag-002"
-
-
-def test_raglab_error_keeps_exception_metadata_through_context_manager():
-    @contextmanager
-    def operation():
-        yield
-
-    error = RaglabError.policy_denied(stage="retrieve", diagnostic_id="diag-003")
 
     with pytest.raises(RaglabError) as caught:
         with operation():

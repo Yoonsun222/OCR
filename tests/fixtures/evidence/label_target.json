@@ -1,0 +1,6 @@
+{
+  "source_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "artifact_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "label": {"bbox": [0.10, 0.20, 0.20, 0.10], "role": "label"},
+  "target": {"polygon": [[0.40, 0.20], [0.70, 0.20], [0.70, 0.60], [0.40, 0.60]], "role": "target"}
+}

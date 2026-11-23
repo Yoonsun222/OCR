@@ -165,9 +165,11 @@ def test_native_relation_accepts_an_explicit_formula_or_range() -> None:
         relations=(
             EvidenceRelation(EvidenceRole.SERIES, "'Data'!$A$2:$A$5", "category"),
             EvidenceRelation(EvidenceRole.VALUE, "=SUM(B2:B4)", None),
+            EvidenceRelation(EvidenceRole.VALUE, "='Data'!$B$2", None),
         ),
     )
     assert item.relations[0].target == "'Data'!$A$2:$A$5"
+    assert item.relations[0].target_region_id is None
 
 
 def test_rendered_relation_requires_both_region_ids_to_exist() -> None:
@@ -201,6 +203,43 @@ def test_envelope_rejects_unknown_relation_targets() -> None:
         replace(
             valid_evidence(),
             relations=(EvidenceRelation(EvidenceRole.TARGET, "missing", None),),
+        )
+
+
+@pytest.mark.parametrize("missing_target", ["B2", "'Data'!$B$2", "=SUM(B2:B4)"])
+def test_rendered_relation_cannot_use_a_native_reference_as_missing_region(
+    missing_target: str,
+) -> None:
+    item = replace(valid_evidence(), extraction_method=ExtractionMethod.OCR)
+    with pytest.raises(ValueError):
+        replace(
+            item,
+            relations=(EvidenceRelation(EvidenceRole.LABEL, item.regions[0].region_id, missing_target),),
+        )
+    with pytest.raises(ValueError):
+        replace(item, relations=(EvidenceRelation(EvidenceRole.TARGET, missing_target),))
+
+
+def test_rendered_relation_can_point_to_an_existing_region_named_like_a_cell() -> None:
+    item = valid_evidence()
+    region = replace(item.regions[0], region_id="B2")
+    evidence = replace(
+        item,
+        regions=(region, *item.regions),
+        relations=(EvidenceRelation(EvidenceRole.LABEL, "B2", item.regions[0].region_id),),
+    )
+    assert evidence.relations[0].target_region_id == item.regions[0].region_id
+
+
+@pytest.mark.parametrize("invalid_formula", ["=)", "=SUM()", "=SUM(B2:B4,)", "=SUM(B2:B4))"])
+def test_native_relation_rejects_malformed_formula(invalid_formula: str) -> None:
+    with pytest.raises(ValueError):
+        replace(
+            valid_evidence(),
+            native_locator=NativeLocator.sheet_object("sheet-1", "chart"),
+            extraction_method=ExtractionMethod.NATIVE,
+            regions=(),
+            relations=(EvidenceRelation(EvidenceRole.VALUE, invalid_formula),),
         )
 
 

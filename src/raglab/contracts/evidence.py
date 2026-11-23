@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Mapping
-from dataclasses import InitVar, dataclass, field
+from dataclasses import InitVar, dataclass, field, replace
 from enum import StrEnum
 from types import MappingProxyType
 
@@ -15,7 +15,12 @@ from .errors import ErrorCode, RaglabError, RetryAdvice
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _CELL = r"\$?[A-Za-z]{1,3}\$?[1-9][0-9]*"
 _SHEET = r"(?:'(?:[^']|'')+'|[\w.]+)!"
-_NATIVE_RANGE = re.compile(rf"(?:{_SHEET})?{_CELL}(?::{_CELL})?")
+_A1_REFERENCE = rf"(?:{_SHEET})?{_CELL}(?::{_CELL})?"
+_NATIVE_RANGE = re.compile(_A1_REFERENCE)
+_REFERENCE_ARGUMENTS = rf"{_A1_REFERENCE}(?:[ \t]*,[ \t]*{_A1_REFERENCE})*"
+_NATIVE_FORMULA = re.compile(
+    rf"=(?:{_A1_REFERENCE}|[A-Za-z_][A-Za-z0-9_.]*\([ \t]*{_REFERENCE_ARGUMENTS}[ \t]*\))"
+)
 
 
 def _is_finite_number(value: object) -> bool:
@@ -181,6 +186,7 @@ class EvidenceRelation:
     role: EvidenceRole
     target: str
     related: str | None = None
+    _points_to_region: bool | None = field(default=None, kw_only=True, repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.role, EvidenceRole):
@@ -190,7 +196,13 @@ class EvidenceRelation:
             raise ValueError("related relation value must be a string")
 
     @property
-    def target_region_id(self) -> str:
+    def target_region_id(self) -> str | None:
+        # The envelope can confirm that a region ID resembling a cell is a real region.
+        points_to_region = self._points_to_region
+        if points_to_region is None:
+            points_to_region = not _is_native_target(self.target)
+        if not points_to_region:
+            return None
         return self.target if self.related is None else self.related
 
     def to_dict(self) -> dict[str, str | None]:
@@ -198,8 +210,12 @@ class EvidenceRelation:
 
 
 def _is_native_target(target: str) -> bool:
-    has_formula = target.startswith("=") and bool(target[1:].strip())
-    return has_formula or _NATIVE_RANGE.fullmatch(target) is not None
+    # Accept direct A1 references and formulas consisting of a reference
+    # or a function call with one or more reference arguments.
+    return (
+        _NATIVE_RANGE.fullmatch(target) is not None
+        or _NATIVE_FORMULA.fullmatch(target) is not None
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,21 +334,26 @@ class EvidenceRegionV1:
         if len(region_ids) != len(regions):
             raise ValueError("region IDs must be unique within an evidence record")
 
-        relations = tuple(self.relations)
-        for relation in relations:
+        relations = []
+        for relation in self.relations:
             if not isinstance(relation, EvidenceRelation):
                 raise ValueError("relations must contain EvidenceRelation records")
-            if relation.target in region_ids:
-                target = relation.target_region_id
-            else:
-                target = relation.target
-            if target not in region_ids and not _is_native_target(target):
-                raise ValueError("relation target must be an existing region or a native formula or range")
+            points_to_region = relation.target in region_ids
+            if points_to_region:
+                if relation.related is not None and relation.related not in region_ids:
+                    raise ValueError("rendered relation destination must be an existing region")
+            elif self.extraction_method is not ExtractionMethod.NATIVE or not _is_native_target(
+                relation.target
+            ):
+                raise ValueError("relation must target an existing region or a supported native reference")
+            if points_to_region != (relation.target_region_id is not None):
+                relation = replace(relation, _points_to_region=points_to_region)
+            relations.append(relation)
 
         if not isinstance(self.metadata, Mapping):
             raise ValueError("metadata must be a JSON object")
         object.__setattr__(self, "regions", regions)
-        object.__setattr__(self, "relations", relations)
+        object.__setattr__(self, "relations", tuple(relations))
         object.__setattr__(self, "metadata", _freeze_json(self.metadata))
 
     def to_dict(self) -> dict[str, object]:

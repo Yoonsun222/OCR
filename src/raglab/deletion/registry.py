@@ -66,34 +66,34 @@ class MemoryDerivativeRegistry:
     def __init__(self) -> None:
         self._derivatives: dict[str, Derivative] = {}
         self._owners: dict[tuple[str, str], str] = {}
-        self._publication_backends: dict[str, MemoryStorageBackend] = {}
+        self._storage_backends: dict[str, MemoryStorageBackend] = {}
         self._tombstones: set[str] = set()
         self._lock = Lock()
+        self._authority = object()
 
-    def register(self, derivative: Derivative) -> None:
-        """Record existing lineage. Use publish when writing an object."""
+    def register(self, derivative: Derivative, backend: "MemoryStorageBackend") -> None:
+        """Record existing lineage against its storage instance."""
         with self._lock:
-            self._register(derivative)
+            self._register(derivative, backend)
 
     def publish(self, derivative: Derivative, backend: "MemoryStorageBackend") -> None:
         """Record lineage and write the object in the same tombstone lock."""
-        if derivative.backend_name != backend.name:
-            raise ValueError("derivative backend does not match publication backend")
         with self._lock:
-            if self._publication_backends.get(backend.name, backend) is not backend:
-                raise _registration_conflict(
-                    "backend name already belongs to a different storage instance",
-                    "one storage instance per backend name",
-                    "use the registered storage backend",
-                )
-            self._register(derivative)
-            self._publication_backends[backend.name] = backend
+            self._register(derivative, backend)
             # Keep lineage if a storage failure leaves the write outcome uncertain.
             backend._put(derivative.object_key)
 
-    def _register(self, derivative: Derivative) -> None:
+    def _register(self, derivative: Derivative, backend: "MemoryStorageBackend") -> None:
         if derivative.source_hash in self._tombstones:
             raise ValueError("cannot register a derivative for a tombstoned source")
+        if derivative.backend_name != backend.name:
+            raise ValueError("derivative backend name does not match storage backend")
+        if self._storage_backends.get(backend.name, backend) is not backend:
+            raise _registration_conflict(
+                "backend name already belongs to a different storage instance",
+                "one storage instance per backend name",
+                "use the registered storage backend",
+            )
         existing = self._derivatives.get(derivative.derivative_id)
         if existing is not None and existing != derivative:
             raise ValueError("derivative identifier is already bound")
@@ -105,6 +105,8 @@ class MemoryDerivativeRegistry:
                 "one derivative owner per storage object",
                 "choose a distinct storage object key",
             )
+        backend._bind_authority(self._authority)
+        self._storage_backends[backend.name] = backend
         self._derivatives[derivative.derivative_id] = derivative
         self._owners[location] = derivative.derivative_id
 
@@ -125,7 +127,10 @@ class MemoryDerivativeRegistry:
 
     def matches_backend(self, name: str, backend: "MemoryStorageBackend") -> bool:
         with self._lock:
-            return backend.name == name and self._publication_backends.get(name, backend) is backend
+            return self._storage_backends.get(name) is backend
+
+    def has_foreign_backend(self, backends: Mapping[str, "MemoryStorageBackend"]) -> bool:
+        return any(backend._owned_by_other(self._authority) for backend in backends.values())
 
 
 class MemoryStorageBackend:
@@ -134,10 +139,25 @@ class MemoryStorageBackend:
         self.retention_locked = retention_locked
         self._object_keys: set[str] = set()
         self._lock = Lock()
+        self._authority: object | None = None
 
     @property
     def name(self) -> str:
         return self._name
+
+    def _bind_authority(self, authority: object) -> None:
+        with self._lock:
+            if self._authority is not None and self._authority is not authority:
+                raise _registration_conflict(
+                    "storage backend already belongs to a different registry",
+                    "one registry authority per storage instance",
+                    "use the registry that owns the storage backend",
+                )
+            self._authority = authority
+
+    def _owned_by_other(self, authority: object) -> bool:
+        with self._lock:
+            return self._authority is not None and self._authority is not authority
 
     def _put(self, object_key: str) -> None:
         with self._lock:
@@ -168,6 +188,8 @@ class DeletionCoordinator:
         )
         expected_derivatives = tuple(derivative.derivative_id for derivative in derivatives)
         deletion_job_id = uuid4().hex
+        if self._registry.has_foreign_backend(self._backends):
+            raise _verification_failed(deletion_job_id, "storage backend belongs to a different registry")
         operations: dict[str, BackendDeletionReceipt] = {}
 
         for derivative in derivatives:

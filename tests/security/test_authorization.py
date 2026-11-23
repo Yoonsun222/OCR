@@ -7,10 +7,26 @@ from raglab.contracts.errors import ErrorCode, RaglabError, RetryAdvice
 from raglab.security.authorization import AuthorizationGuard, MemoryPolicyStore
 
 
+def test_guard_requires_explicit_mode() -> None:
+    with pytest.raises(TypeError):
+        AuthorizationGuard(MemoryPolicyStore())
+
+
+@pytest.mark.parametrize("blocker", [None, False])
+def test_deletion_managed_guard_requires_a_callable_blocker(blocker: object) -> None:
+    with pytest.raises(TypeError):
+        AuthorizationGuard.deletion_managed(MemoryPolicyStore(), blocker)
+
+
+def test_deletion_managed_mode_rejects_missing_blocker() -> None:
+    with pytest.raises(TypeError, match="callable"):
+        AuthorizationGuard(MemoryPolicyStore(), mode="deletion_managed")
+
+
 def test_epoch_change_discards_result_at_every_boundary() -> None:
     store = MemoryPolicyStore()
     store.allow("user_01", "doc_01", group_hash="g" * 64)
-    guard = AuthorizationGuard(store)
+    guard = AuthorizationGuard.policy_only(store)
     pin = guard.pin("user_01", "g" * 64, "doc_01", "doc-v1", "gen_01")
     stages = ("retrieve", "source_load", "model", "serialize", "highlight_open")
     for stage in stages:
@@ -36,7 +52,7 @@ def test_epoch_change_discards_result_at_every_boundary() -> None:
 def test_cache_key_changes_with_each_pinned_dimension() -> None:
     store = MemoryPolicyStore()
     store.allow("user_01", "doc_01", group_hash="g" * 64)
-    guard = AuthorizationGuard(store)
+    guard = AuthorizationGuard.policy_only(store)
     first = guard.pin("user_01", "g" * 64, "doc_01", "doc-v1", "gen_01")
     assert UUID(str(first.query_snapshot_id)).version == 4
 
@@ -63,7 +79,7 @@ def test_cache_key_changes_with_each_pinned_dimension() -> None:
 def test_policy_store_failure_is_fail_closed() -> None:
     store = MemoryPolicyStore()
     store.allow("user_01", "doc_01", group_hash="g" * 64)
-    guard = AuthorizationGuard(store)
+    guard = AuthorizationGuard.policy_only(store)
     pin = guard.pin("user_01", "g" * 64, "doc_01", "doc-v1", "gen_01")
     store.fail_reads = True
 
@@ -86,7 +102,7 @@ def test_denied_principal_group_pair_cannot_discover_document_existence() -> Non
     store = MemoryPolicyStore()
     store.allow("user_01", "doc_01", group_hash="g" * 64)
     store.allow("user_02", "doc_01", group_hash="h" * 64)
-    guard = AuthorizationGuard(store)
+    guard = AuthorizationGuard.policy_only(store)
     errors = []
 
     for document_id in ("doc_01", "doc_02"):

@@ -2,6 +2,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from threading import Lock
 from types import MappingProxyType
+from typing import Literal
 from uuid import uuid4
 
 from raglab.contracts.errors import ErrorCode, RaglabError, RetryAdvice
@@ -93,10 +94,26 @@ class AuthorizationGuard:
         self,
         store: MemoryPolicyStore,
         *,
+        mode: Literal["policy_only", "deletion_managed"],
         serving_blocked: Callable[[str], bool] | None = None,
     ) -> None:
+        if mode == "deletion_managed":
+            if not callable(serving_blocked):
+                raise TypeError("deletion-managed authorization requires a callable serving blocker")
+        elif mode != "policy_only" or serving_blocked is not None:
+            raise TypeError("policy-only authorization requires policy_only mode without a blocker")
         self._store = store
         self._serving_blocked = serving_blocked
+
+    @classmethod
+    def policy_only(cls, store: MemoryPolicyStore) -> "AuthorizationGuard":
+        return cls(store, mode="policy_only")
+
+    @classmethod
+    def deletion_managed(
+        cls, store: MemoryPolicyStore, serving_blocked: Callable[[str], bool]
+    ) -> "AuthorizationGuard":
+        return cls(store, mode="deletion_managed", serving_blocked=serving_blocked)
 
     def pin(
         self,

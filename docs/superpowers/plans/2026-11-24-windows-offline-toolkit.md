@@ -218,6 +218,8 @@ git commit -m "feat: add offline toolkit CLI skeleton"
 
 ### Task 2: Approved Bundle Verification
 
+Implementation uses the native Windows verification and provisioning contract in [Windows bundle verification](../../operator/WINDOWS-BUNDLE-TRUST.md). The snippets below record the initial implementation plan.
+
 **Files:**
 - Create: `src/raglab/offline/ports.py`
 - Create: `src/raglab/offline/bundle.py`
@@ -506,7 +508,7 @@ Checks execute in this order: bundle approval, OS and Python range, physical/ava
 
 - [ ] **Step 4: Implement PowerShell 5.1-safe Windows adapters**
 
-`WindowsSystemProbe` calls `powershell.exe -NoProfile -NonInteractive -Command` with a checked-in constant script, parses JSON from `ConvertTo-Json -Compress`, enforces a 10-second timeout, and never interpolates document paths into script source. `PowerShellCatalogVerifier` validates `Status`, signer thumbprint, and catalog path. `WindowsEgressPolicyProbe` inspects active firewall profiles, outbound defaults, proxy environment variables, WinHTTP proxy, and configured security-owned canary metadata without sending a packet.
+`WindowsSystemProbe` calls `powershell.exe -NoProfile -NonInteractive -Command` with a checked-in constant script, parses JSON from `ConvertTo-Json -Compress`, enforces a 10-second timeout, and never interpolates document paths into script source. `WindowsCatalogVerifier` validates cache-only Authenticode and exact SHA-256 bundle membership. `WindowsEgressPolicyProbe` inspects active firewall profiles, outbound defaults, proxy environment variables, WinHTTP proxy, and configured security-owned canary metadata without sending a packet.
 
 The active canary is a separate adapter unavailable from the default doctor. It requires all of `--active-egress-canary`, `--approval-id`, and a canary endpoint already present in the signed site profile. Its test double verifies failure semantics; actual company execution belongs to the security acceptance runbook.
 

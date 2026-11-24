@@ -7,19 +7,34 @@ from pathlib import Path
 
 import pytest
 
-from raglab.offline.bundle import verify_bundle
+from raglab.offline.bundle import verify_bundle as verify
 from raglab.offline.ports import CatalogDecision
 
+
+pytestmark = pytest.mark.skipif(os.name != "nt", reason="Windows offline bundle contract")
 
 THUMBPRINT = "0123456789ABCDEF0123456789ABCDEF01234567"
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "bundle-valid"
 
 
+class SyntheticAuthority:
+    def approved_thumbprints(self):
+        return frozenset({THUMBPRINT})
+
+
+def verify_bundle(root, verifier):
+    return verify(root, verifier, publisher_authority=SyntheticAuthority())
+
+
 class AcceptCatalog:
-    def verify(self, catalog_path: Path) -> CatalogDecision:
-        assert catalog_path.name == "bundle.cat"
-        assert catalog_path.is_file()
-        return CatalogDecision(True, THUMBPRINT.lower(), None)
+    def verify(self, catalog, files, deadline) -> CatalogDecision:
+        assert catalog.path.name == "bundle.cat"
+        assert catalog.info is not None
+        members = {
+            name: hashlib.sha256(member.read_bytes(member.info.size)).hexdigest()
+            for name, member in files.items()
+        }
+        return CatalogDecision(True, THUMBPRINT.lower(), None, members)
 
 
 @pytest.fixture
@@ -189,7 +204,7 @@ def test_unapproved_license_blocks_bundle(bundle):
 
 def test_missing_catalog_blocks_before_calling_verifier(bundle):
     class UnusedVerifier:
-        def verify(self, _):
+        def verify(self, *_):
             pytest.fail("a missing catalog reached the verifier")
 
     (bundle / "bundle.cat").unlink()
@@ -200,7 +215,7 @@ def test_verifier_reason_and_signer_are_never_echoed(bundle):
     private = str(bundle / "private-input")
 
     class RejectCatalog:
-        def verify(self, _):
+        def verify(self, *_):
             return CatalogDecision(False, private, private)
 
     report = verify_bundle(bundle, RejectCatalog())
@@ -210,7 +225,7 @@ def test_verifier_reason_and_signer_are_never_echoed(bundle):
 
 def test_unsigned_approval_id_does_not_appear_in_catalog_failure(bundle):
     class RejectCatalog:
-        def verify(self, _):
+        def verify(self, *_):
             return CatalogDecision(False, None, None)
 
     report = verify_bundle(bundle, RejectCatalog())
@@ -228,7 +243,7 @@ def test_verifier_exception_blocks_without_exposing_operator_paths(bundle):
     private = str(bundle / "private-input")
 
     class CrashingVerifier:
-        def verify(self, _):
+        def verify(self, *_):
             raise RuntimeError(private)
 
     report = verify_bundle(bundle, CrashingVerifier())
@@ -237,12 +252,11 @@ def test_verifier_exception_blocks_without_exposing_operator_paths(bundle):
 
 
 def test_verified_metadata_digest_must_match_the_parsed_bytes(bundle):
-    class MismatchedApprovalCatalog:
-        def verify(self, _):
+    class MismatchedApprovalCatalog(AcceptCatalog):
+        def verify(self, catalog, files, deadline):
+            decision = super().verify(catalog, files, deadline)
             return CatalogDecision(
-                True, THUMBPRINT, None,
-                manifest_sha256=hashlib.sha256((bundle / "manifest.json").read_bytes()).hexdigest(),
-                approval_sha256="0" * 64,
+                True, THUMBPRINT, None, {**decision.members, "approval.json": "0" * 64},
             )
 
     report = verify_bundle(bundle, MismatchedApprovalCatalog())

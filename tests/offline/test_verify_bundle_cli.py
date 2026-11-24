@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -9,13 +10,24 @@ from raglab.cli import main
 from raglab.offline.ports import CatalogDecision
 
 
+pytestmark = pytest.mark.skipif(os.name != "nt", reason="Windows offline bundle contract")
+
 THUMBPRINT = "0123456789ABCDEF0123456789ABCDEF01234567"
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "bundle-valid"
 
 
+class SyntheticAuthority:
+    def approved_thumbprints(self):
+        return frozenset({THUMBPRINT})
+
+
 class SyntheticVerifier:
-    def verify(self, catalog_path: Path) -> CatalogDecision:
-        return CatalogDecision(catalog_path.is_file(), THUMBPRINT, None)
+    def verify(self, catalog, files, deadline) -> CatalogDecision:
+        members = {
+            name: hashlib.sha256(member.read_bytes(member.info.size)).hexdigest()
+            for name, member in files.items()
+        }
+        return CatalogDecision(catalog.info is not None, THUMBPRINT, None, members)
 
 
 @pytest.fixture
@@ -31,20 +43,27 @@ def invoke(bundle, output):
     return main(
         ["verify-bundle", "--bundle", str(bundle), "--report", str(output)],
         catalog_verifier=SyntheticVerifier(),
+        publisher_authority=SyntheticAuthority(),
     )
 
 
 def test_verify_bundle_writes_passing_report(bundle, tmp_path):
     output = tmp_path / "reports" / "result.json"
     assert invoke(bundle, output) == 0
-    assert json.loads(output.read_text(encoding="utf-8")) == {
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report == {
         "status": "PASS", "approval_id": "APR-TEST", "failures": [],
+        "generation_fingerprint": report["generation_fingerprint"],
     }
+    assert len(report["generation_fingerprint"]) == 64
 
 
 def test_verify_bundle_uses_default_report_path(bundle, tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
-    assert main(["verify-bundle", "--bundle", str(bundle)], catalog_verifier=SyntheticVerifier()) == 0
+    assert main(
+        ["verify-bundle", "--bundle", str(bundle)],
+        catalog_verifier=SyntheticVerifier(), publisher_authority=SyntheticAuthority(),
+    ) == 0
     assert json.loads(Path("runs/verify-bundle.json").read_text(encoding="utf-8"))["status"] == "PASS"
 
 
@@ -103,29 +122,20 @@ def test_report_cannot_overwrite_bundle_metadata(bundle):
 
 
 def test_command_uses_production_verifier_by_default(bundle, tmp_path, monkeypatch):
-    from raglab.offline import windows
+    from raglab.offline.windows import WindowsCatalogVerifier
 
-    def successful_process(_command, **_options):
-        import subprocess
+    calls = []
 
-        return subprocess.CompletedProcess(
-            [], 0, json.dumps({
-                "Status": "Valid",
-                "Thumbprint": THUMBPRINT,
-                "MembershipStatus": "Valid",
-                "MembershipThumbprint": THUMBPRINT,
-                "MembershipSignatureStatus": "Valid",
-                "HashAlgorithm": "SHA256",
-                "ManifestSha256": hashlib.sha256((bundle / "manifest.json").read_bytes()).hexdigest(),
-                "ApprovalSha256": hashlib.sha256((bundle / "approval.json").read_bytes()).hexdigest(),
-            }), "",
-        )
+    def successful_native(_verifier, catalog, files, deadline):
+        calls.append(catalog.path.name)
+        return SyntheticVerifier().verify(catalog, files, deadline)
 
-    monkeypatch.setenv("SystemRoot", str(tmp_path))
-    monkeypatch.setattr(windows.subprocess, "run", successful_process)
-    assert main([
-        "verify-bundle", "--bundle", str(bundle), "--report", str(tmp_path / "report.json"),
-    ]) == 0
+    monkeypatch.setattr(WindowsCatalogVerifier, "verify", successful_native)
+    assert main(
+        ["verify-bundle", "--bundle", str(bundle), "--report", str(tmp_path / "report.json")],
+        publisher_authority=SyntheticAuthority(),
+    ) == 0
+    assert calls == ["bundle.cat"]
 
 
 def test_cli_parse_error_does_not_echo_unrecognized_operator_path(tmp_path, capsys):

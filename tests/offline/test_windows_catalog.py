@@ -1,143 +1,178 @@
-import json
+import ctypes
+import hashlib
 import os
 import shutil
 import subprocess
+import sys
+from contextlib import ExitStack, nullcontext
 
 import pytest
 
 from raglab.offline import windows
+from raglab.offline.ports import VerificationDeadline
+from raglab.offline.windows_paths import WindowsLocalPaths
 
 
+pytestmark = pytest.mark.skipif(os.name != "nt", reason="Windows catalog API")
 THUMBPRINT = "0123456789ABCDEF0123456789ABCDEF01234567"
-VALID_RESULT = {
-    "Status": "Valid",
-    "Thumbprint": THUMBPRINT.lower(),
-    "MembershipStatus": "Valid",
-    "MembershipThumbprint": THUMBPRINT,
-    "MembershipSignatureStatus": "Valid",
-    "HashAlgorithm": "SHA256",
-    "ManifestSha256": "A" * 64,
-    "ApprovalSha256": "B" * 64,
-}
 
 
-@pytest.fixture
-def catalog(tmp_path, monkeypatch):
-    monkeypatch.setenv("SystemRoot", str(tmp_path))
-    name = "bundle [space]; $(Write-Output INJECTED) O'Brien"
-    root = tmp_path / name
+def test_company_publisher_policy_reads_hklm_64_bit_view(monkeypatch):
+    import winreg
+
+    def open_key(hive, path, reserved, flags):
+        assert hive == winreg.HKEY_LOCAL_MACHINE
+        assert path == r"SOFTWARE\Policies\RagLab\OfflineToolkit"
+        assert reserved == 0
+        assert flags == winreg.KEY_READ | winreg.KEY_WOW64_64KEY
+        return nullcontext("machine policy")
+
+    def query(key, value):
+        assert key == "machine policy"
+        assert value == "ApprovedPublisherThumbprints"
+        return [THUMBPRINT.lower()], winreg.REG_MULTI_SZ
+
+    monkeypatch.setattr(winreg, "OpenKey", open_key)
+    monkeypatch.setattr(winreg, "QueryValueEx", query)
+    assert windows.MachinePublisherAuthority().approved_thumbprints() == {THUMBPRINT}
+
+
+@pytest.mark.parametrize("policy", [[], ["bad"], ["A" * 41], ["0123"]])
+def test_invalid_machine_publisher_policy_blocks(monkeypatch, policy):
+    import winreg
+
+    monkeypatch.setattr(winreg, "OpenKey", lambda *args: nullcontext(None))
+    monkeypatch.setattr(winreg, "QueryValueEx", lambda *args: (policy, winreg.REG_MULTI_SZ))
+    with pytest.raises(ValueError):
+        windows.MachinePublisherAuthority().approved_thumbprints()
+
+
+def test_catalog_native_wintrust_uses_cache_only_and_closes_expired_state(tmp_path):
+    import raglab.offline.windows_paths as paths
+
+    observed = []
+    now = 0
+    deadline = VerificationDeadline(1, lambda: now)
+
+    def fake_wintrust(window, policy, pointer):
+        nonlocal now
+        data = ctypes.cast(pointer, ctypes.POINTER(windows._WinTrustData)).contents
+        observed.append(data.state_action)
+        assert data.provider_flags & 0x1000
+        assert data.file.contents.file == 5
+        if data.state_action == 1:
+            data.state_data = 99
+            now = 2
+        return 0
+
+    class Probe(windows._NativeCatalog):
+        def __init__(self):
+            self.verify_trust = fake_wintrust
+
+    fixture = paths.PinnedPath(tmp_path / "bundle.cat", None, 5)
+    with pytest.raises(TimeoutError):
+        Probe().signer(fixture, deadline)
+    assert observed == [1, 2]
+
+    observed.clear()
+    with pytest.raises(TimeoutError):
+        Probe().signer(fixture, deadline)
+    assert observed == []
+
+
+def test_catalog_open_deadline_closes_native_handle(tmp_path):
+    import raglab.offline.windows_paths as paths
+
+    now = 0
+    calls = []
+    deadline = VerificationDeadline(1, lambda: now)
+
+    class Probe(windows._NativeCatalog):
+        def __init__(self):
+            pass
+
+        def cat_open(self, *_args):
+            nonlocal now
+            calls.append("open")
+            now = 2
+            return 12
+
+        def cat_close(self, handle):
+            assert handle == 12
+            calls.append("close")
+            return True
+
+    with pytest.raises(TimeoutError):
+        Probe().members(paths.PinnedPath(tmp_path / "bundle.cat", None), 3, deadline)
+    assert calls == ["open", "close"]
+
+
+@pytest.mark.skipif(not shutil.which("powershell.exe"), reason="PowerShell 5.1 catalog fixture")
+def test_native_catalog_uses_literal_path_and_matches_windows_sip_hashes(tmp_path):
+    root = tmp_path / "bundle [space]; $(Write-Output INJECTED) O'Brien"
     root.mkdir()
-    catalog = root / "bundle.cat"
-    catalog.touch()
-    return catalog
-
-
-def intercept_output(monkeypatch, payload, returncode=0):
-    monkeypatch.setattr(
-        windows.subprocess, "run",
-        lambda command, **kwargs: subprocess.CompletedProcess(command, returncode, payload, ""),
-    )
-
-
-def test_powershell_command_keeps_catalog_path_out_of_script(catalog, monkeypatch):
-    def inspect_process(command, **options):
-        assert command[1:4] == ["-NoProfile", "-NonInteractive", "-Command"]
-        assert command[0].endswith("powershell.exe")
-        assert str(catalog) not in " ".join(command)
-        assert str(catalog) in options["env"].values()
-        assert "Get-AuthenticodeSignature -LiteralPath" in command[-1]
-        assert "Test-FileCatalog" in command[-1]
-        assert options["timeout"] > 0
-        return subprocess.CompletedProcess(command, 0, json.dumps(VALID_RESULT), "")
-
-    monkeypatch.setattr(windows.subprocess, "run", inspect_process)
-    result = windows.PowerShellCatalogVerifier().verify(catalog)
-    assert result.valid is True
-    assert result.signer == THUMBPRINT
-    assert result.manifest_sha256 == "a" * 64
-    assert result.approval_sha256 == "b" * 64
-
-
-@pytest.mark.parametrize("changes", [
-    {"Status": "NotSigned"}, {"Status": 0}, {"Thumbprint": None}, {"Thumbprint": "bad"},
-    {"MembershipStatus": "ValidationFailed"}, {"MembershipStatus": None},
-    {"MembershipThumbprint": "C" * 40}, {"HashAlgorithm": "SHA1"},
-    {"MembershipSignatureStatus": "HashMismatch"},
-    {"ManifestSha256": None}, {"ApprovalSha256": None},
-])
-def test_invalid_signature_or_membership_blocks(catalog, monkeypatch, changes):
-    intercept_output(monkeypatch, json.dumps({**VALID_RESULT, **changes}))
-    assert windows.PowerShellCatalogVerifier().verify(catalog).valid is False
-
-
-@pytest.mark.parametrize("payload,returncode", [
-    ("not json", 0), ("null", 0), ("[]", 0), ("{}", 0),
-    (json.dumps(VALID_RESULT), 1),
-])
-def test_invalid_subprocess_result_blocks(catalog, monkeypatch, payload, returncode):
-    intercept_output(monkeypatch, payload, returncode)
-    assert windows.PowerShellCatalogVerifier().verify(catalog).valid is False
-
-
-@pytest.mark.parametrize("exception", [
-    OSError("private-path"), subprocess.TimeoutExpired("private-path", 10),
-])
-def test_process_failure_has_generic_reason(catalog, monkeypatch, exception):
-    def fail(*_, **__):
-        raise exception
-
-    monkeypatch.setattr(windows.subprocess, "run", fail)
-    result = windows.PowerShellCatalogVerifier().verify(catalog)
-    assert result.valid is False
-    assert "private-path" not in (result.reason or "")
-
-
-@pytest.mark.skipif(
-    os.name != "nt" or not shutil.which("powershell.exe"), reason="Windows PowerShell 5.1 required",
-)
-def test_real_powershell_uses_literal_metacharacter_path(catalog, monkeypatch):
-    monkeypatch.undo()
-    # Create a real unsigned catalog on this local host and call the same production script,
-    # which must see it as unsigned instead of dropping or interpreting path characters.
-    staged = catalog.with_name("manifest.json")
-    staged.write_text("{}", encoding="utf-8")
-    catalog.unlink()
-    sibling = catalog.parent.with_suffix(".cat")
+    artifact = root / "payload.exe"
+    shutil.copyfile(sys.executable, artifact)
+    (root / "manifest.json").write_bytes(b"{}")
+    (root / "approval.json").write_bytes(b"{}")
+    output = tmp_path / "source.cat"
     setup = """
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $env:PSModulePath = [IO.Path]::Combine($PSHOME, 'Modules')
+if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) { exit 2 }
 Set-Location -LiteralPath $env:RAGLAB_TEST_ROOT
 New-FileCatalog -Path . -CatalogFilePath $env:RAGLAB_TEST_CAT -CatalogVersion 2 | Out-Null
 """
-    setup_result = subprocess.run(
+    result = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", setup],
-        env={**os.environ, "RAGLAB_TEST_ROOT": str(catalog.parent), "RAGLAB_TEST_CAT": str(sibling)},
-        capture_output=True, timeout=10,
+        env={**os.environ, "RAGLAB_TEST_ROOT": str(root), "RAGLAB_TEST_CAT": str(output)},
+        capture_output=True, timeout=15,
     )
-    assert setup_result.returncode == 0, setup_result.stderr
-    sibling.rename(catalog)
+    assert result.returncode == 0, result.stderr
+    output.rename(root / "bundle.cat")
+    paths = WindowsLocalPaths()
+    native = windows._NativeCatalog()
+    deadline = VerificationDeadline(15)
 
-    native_run = subprocess.run
-    observed = []
+    with ExitStack() as handles:
+        held = handles.enter_context(paths.pin(paths.validate(root)))
+        catalog = handles.enter_context(paths.pin_entry(held.path / "bundle.cat"))
+        files = {
+            name: handles.enter_context(paths.pin_entry(held.path / name))
+            for name in ("manifest.json", "approval.json", "payload.exe")
+        }
+        assert native.signer(catalog, deadline) is None
+        members = native.members(catalog, len(files), deadline)
+        assert members.keys() == files.keys()
+        assert members["manifest.json"] == hashlib.sha256(b"{}").hexdigest()
+        assert members["approval.json"] == members["manifest.json"]
+        assert native.member_hashes_match(files, members, deadline)
+        assert not windows.WindowsCatalogVerifier().verify(catalog, files, deadline).valid
+        with pytest.raises(ValueError):
+            native.members(catalog, 1, deadline)
 
-    def capture_result(*args, **kwargs):
-        result = native_run(*args, **kwargs)
-        observed.append(result)
-        return result
+    artifact.write_bytes(b"tampered")
+    with ExitStack() as handles:
+        held = handles.enter_context(paths.pin(paths.validate(root)))
+        files = {
+            name: handles.enter_context(paths.pin_entry(held.path / name))
+            for name in ("manifest.json", "approval.json", "payload.exe")
+        }
+        assert not native.member_hashes_match(files, members, deadline)
 
-    monkeypatch.setattr(windows.subprocess, "run", capture_result)
-    assert windows.PowerShellCatalogVerifier().verify(catalog).valid is False
-    assert observed[0].returncode == 0, observed[0].stderr
-    result = json.loads(observed[0].stdout)
-    assert result["Status"] == "NotSigned"
-    assert result["MembershipStatus"] == "Valid"
-    assert result["ManifestSha256"] is not None
-    assert result["ApprovalSha256"] is None
 
-    assert result["MembershipSignatureStatus"] == "NotSigned"
+def test_system_dll_loader_ignores_environment_and_limits_search(monkeypatch):
+    from raglab.offline.windows_paths import system_dll
 
-    staged.write_text('{"tampered":true}', encoding="utf-8")
-    assert windows.PowerShellCatalogVerifier().verify(catalog).valid is False
-    assert observed[1].returncode == 0, observed[1].stderr
-    assert json.loads(observed[1].stdout)["MembershipStatus"] == "ValidationFailed"
+    monkeypatch.setenv("SystemRoot", "C:/untrusted")
+    handle = object()
+    seen = []
+
+    def load(library, **kwargs):
+        seen.append((library, kwargs))
+        return handle
+
+    monkeypatch.setattr(ctypes, "WinDLL", load)
+    assert system_dll("wintrust.dll") is handle
+    assert seen == [("wintrust.dll", {"winmode": 0x800, "use_last_error": True})]

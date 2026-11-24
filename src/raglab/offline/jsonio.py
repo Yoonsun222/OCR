@@ -7,7 +7,9 @@ from pathlib import Path
 
 def write_json_atomic(path: Path, value: Mapping[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    serialized = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    serialized = json.dumps(
+        dict(value), ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False
+    ) + "\n"
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(

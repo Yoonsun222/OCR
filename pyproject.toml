@@ -3,9 +3,9 @@ requires = ["setuptools==75.8.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "raglab"
+name = "secure-multimodal-rag-lab"
 version = "0.1.0"
-requires-python = ">=3.11,<3.12"
+requires-python = ">=3.11,<3.13"
 dependencies = []
 
 [project.optional-dependencies]
@@ -17,3 +17,4 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 addopts = "--strict-markers"
+testpaths = ["tests"]

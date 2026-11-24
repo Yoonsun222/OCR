@@ -11,12 +11,22 @@ from raglab.observability.events import (
     JsonlEventWriter,
     OpaqueId,
     OpaqueIdKind,
+    OpaqueIdRegistry,
     SafeEvent,
 )
 
 
+ID_REGISTRY = OpaqueIdRegistry()
+
+
 def opaque(kind: OpaqueIdKind, suffix: str = "01") -> OpaqueId:
-    return OpaqueId.parse(f"{kind.value}_{suffix:0>32}")
+    source_prefix = {
+        OpaqueIdKind.RUN: "run",
+        OpaqueIdKind.QUERY: "query",
+        OpaqueIdKind.DOCUMENT: "doc",
+        OpaqueIdKind.GENERATION: "gen",
+    }[kind]
+    return ID_REGISTRY.map(kind, f"{source_prefix}_{suffix}")
 
 
 def sample_event(metrics: dict[str, object] | None = None) -> SafeEvent:
@@ -120,10 +130,61 @@ def test_writers_append_independent_lines_at_same_path(tmp_path: Path, monkeypat
     assert sorted(record["metrics"]["retry_count"] for record in records) == list(range(12))
 
 
-@pytest.mark.parametrize("kind", list(OpaqueIdKind))
-def test_opaque_id_parse_requires_kind_and_32_lowercase_hex(kind: OpaqueIdKind) -> None:
-    with pytest.raises(ValueError, match="invalid opaque identifier"):
-        OpaqueId.parse(f"{kind.value}_friendly_slug")
+def test_opaque_id_has_no_public_parse_or_issue_constructor() -> None:
+    assert not hasattr(OpaqueId, "parse")
+    assert not hasattr(OpaqueId, "issue")
+    with pytest.raises(TypeError):
+        OpaqueId(OpaqueIdKind.DOCUMENT, "document_0123456789abcdef0123456789abcdef")
+
+
+def test_registry_maps_legacy_ids_stably_without_exposing_source_values(tmp_path: Path) -> None:
+    registry = OpaqueIdRegistry()
+    mapped = registry.map(OpaqueIdKind.DOCUMENT, "doc_01")
+    assert registry.map(OpaqueIdKind.DOCUMENT, "doc_01") is mapped
+    assert "doc_01" not in repr(mapped)
+
+    event = SafeEvent(
+        EventName.STAGE_FINISHED,
+        registry.map(OpaqueIdKind.RUN, "run_01"),
+        registry.map(OpaqueIdKind.QUERY, "query_01"),
+        mapped,
+        registry.map(OpaqueIdKind.GENERATION, "gen_01"),
+        EventStage.RETRIEVE,
+    )
+    assert all(source not in repr(event) for source in ("run_01", "query_01", "doc_01", "gen_01"))
+    event_path = tmp_path / "events.jsonl"
+    JsonlEventWriter(event_path).write(event)
+    serialized = event_path.read_text(encoding="utf-8")
+    assert all(source not in serialized for source in ("run_01", "query_01", "doc_01", "gen_01"))
+
+
+def test_registry_rejects_encoded_payload_tokens_without_reflecting_them() -> None:
+    encoded_payload = "doc_U2VjcmV0LnBkZg=="
+    with pytest.raises(ValueError) as error:
+        OpaqueIdRegistry().map(OpaqueIdKind.DOCUMENT, encoded_payload)
+    assert str(error.value) == "invalid upstream identifier"
+    assert encoded_payload not in str(error.value)
+
+
+def test_registry_rejects_wrong_kind_source_prefix() -> None:
+    with pytest.raises(ValueError, match="invalid upstream identifier"):
+        OpaqueIdRegistry().map(OpaqueIdKind.DOCUMENT, "gen_01")
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [EventStage.SOURCE_LOAD, EventStage.MODEL, EventStage.SERIALIZE, EventStage.HIGHLIGHT_OPEN],
+)
+def test_additional_registered_stages_are_accepted(stage: EventStage) -> None:
+    event = SafeEvent(
+        EventName.STAGE_FINISHED,
+        opaque(OpaqueIdKind.RUN),
+        opaque(OpaqueIdKind.QUERY),
+        opaque(OpaqueIdKind.DOCUMENT),
+        opaque(OpaqueIdKind.GENERATION),
+        stage,
+    )
+    assert event.stage is stage
 
 
 def test_event_requires_typed_ids_of_their_registered_kinds() -> None:

@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import threading
+import weakref
 from collections.abc import Mapping
 from dataclasses import InitVar, dataclass, field
 from datetime import UTC, datetime
@@ -28,10 +29,13 @@ class OpaqueIdKind(StrEnum):
 
 
 _OPAQUE_VALUE = re.compile(r"(?:run|query|document|generation)_[0-9a-f]{32}\Z")
+_SOURCE_ID = re.compile(r"(?:run|query|doc|gen)_[0-9]{1,16}\Z")
 _ID_FACTORY = object()
+_ISSUED_IDS: weakref.WeakSet[OpaqueId] = weakref.WeakSet()
+_ISSUED_LOCK = threading.Lock()
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class OpaqueId:
     """A registered-kind ID represented only by a kind and 128-bit hex token."""
 
@@ -41,7 +45,7 @@ class OpaqueId:
 
     def __post_init__(self, _factory: object) -> None:
         if _factory is not _ID_FACTORY:
-            raise TypeError("use OpaqueId.issue or OpaqueId.parse")
+            raise TypeError("opaque IDs are issued only by OpaqueIdRegistry")
         if not isinstance(self.kind, OpaqueIdKind):
             raise ValueError("invalid opaque identifier")
         if not isinstance(self.value, str) or _OPAQUE_VALUE.fullmatch(self.value) is None:
@@ -49,22 +53,42 @@ class OpaqueId:
         if not self.value.startswith(f"{self.kind.value}_"):
             raise ValueError("invalid opaque identifier")
 
-    @classmethod
-    def issue(cls, kind: OpaqueIdKind) -> OpaqueId:
-        if not isinstance(kind, OpaqueIdKind):
-            raise ValueError("invalid opaque identifier kind")
-        return cls(kind, f"{kind.value}_{secrets.token_hex(16)}", _factory=_ID_FACTORY)
+class OpaqueIdRegistry:
+    """Map validated upstream IDs to random observability-only IDs."""
 
-    @classmethod
-    def parse(cls, value: str) -> OpaqueId:
-        if not isinstance(value, str) or _OPAQUE_VALUE.fullmatch(value) is None:
-            raise ValueError("invalid opaque identifier")
-        kind_label = value.partition("_")[0]
-        try:
-            kind = OpaqueIdKind(kind_label)
-        except ValueError as exc:
-            raise ValueError("invalid opaque identifier") from exc
-        return cls(kind, value, _factory=_ID_FACTORY)
+    _SOURCE_PREFIX = {
+        OpaqueIdKind.RUN: "run",
+        OpaqueIdKind.QUERY: "query",
+        OpaqueIdKind.DOCUMENT: "doc",
+        OpaqueIdKind.GENERATION: "gen",
+    }
+
+    def __init__(self) -> None:
+        self._ids: dict[tuple[OpaqueIdKind, str], OpaqueId] = {}
+        self._lock = threading.Lock()
+
+    def map(self, kind: OpaqueIdKind, source_id: str) -> OpaqueId:
+        if not isinstance(kind, OpaqueIdKind) or not isinstance(source_id, str):
+            raise ValueError("invalid upstream identifier")
+        if _SOURCE_ID.fullmatch(source_id) is None:
+            raise ValueError("invalid upstream identifier")
+        if not source_id.startswith(f"{self._SOURCE_PREFIX[kind]}_"):
+            raise ValueError("invalid upstream identifier")
+        key = (kind, source_id)
+        with self._lock:
+            existing = self._ids.get(key)
+            if existing is not None:
+                return existing
+            identifier = OpaqueId(kind, f"{kind.value}_{secrets.token_hex(16)}", _factory=_ID_FACTORY)
+            with _ISSUED_LOCK:
+                _ISSUED_IDS.add(identifier)
+            self._ids[key] = identifier
+            return identifier
+
+
+def _is_registry_issued(identifier: OpaqueId) -> bool:
+    with _ISSUED_LOCK:
+        return identifier in _ISSUED_IDS
 
 
 class EventStage(StrEnum):
@@ -73,6 +97,10 @@ class EventStage(StrEnum):
     GENERATE = "generate"
     INDEX = "index"
     RETRIEVE = "retrieve"
+    SOURCE_LOAD = "source_load"
+    MODEL = "model"
+    SERIALIZE = "serialize"
+    HIGHLIGHT_OPEN = "highlight_open"
 
 
 _ALLOWED_METRICS = frozenset(
@@ -111,7 +139,11 @@ class SafeEvent:
         }
         for name, expected_kind in expected_kinds.items():
             value = getattr(self, name)
-            if not isinstance(value, OpaqueId) or value.kind is not expected_kind:
+            if (
+                not isinstance(value, OpaqueId)
+                or value.kind is not expected_kind
+                or not _is_registry_issued(value)
+            ):
                 raise ValueError(f"{name} must be a {expected_kind.value} OpaqueId")
         if not isinstance(self.stage, EventStage):
             raise ValueError("stage must be a registered EventStage")

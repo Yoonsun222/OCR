@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import threading
+import unicodedata
 import weakref
 from collections.abc import Mapping
 from dataclasses import InitVar, dataclass, field
@@ -29,7 +30,6 @@ class OpaqueIdKind(StrEnum):
 
 
 _OPAQUE_VALUE = re.compile(r"(?:run|query|document|generation)_[0-9a-f]{32}\Z")
-_SOURCE_ID = re.compile(r"(?:run|query|doc|gen)_[0-9]{1,16}\Z")
 _ID_FACTORY = object()
 _ISSUED_IDS: weakref.WeakSet[OpaqueId] = weakref.WeakSet()
 _ISSUED_LOCK = threading.Lock()
@@ -56,13 +56,6 @@ class OpaqueId:
 class OpaqueIdRegistry:
     """Map validated upstream IDs to random observability-only IDs."""
 
-    _SOURCE_PREFIX = {
-        OpaqueIdKind.RUN: "run",
-        OpaqueIdKind.QUERY: "query",
-        OpaqueIdKind.DOCUMENT: "doc",
-        OpaqueIdKind.GENERATION: "gen",
-    }
-
     def __init__(self) -> None:
         self._ids: dict[tuple[OpaqueIdKind, str], OpaqueId] = {}
         self._lock = threading.Lock()
@@ -70,9 +63,11 @@ class OpaqueIdRegistry:
     def map(self, kind: OpaqueIdKind, source_id: str) -> OpaqueId:
         if not isinstance(kind, OpaqueIdKind) or not isinstance(source_id, str):
             raise ValueError("invalid upstream identifier")
-        if _SOURCE_ID.fullmatch(source_id) is None:
-            raise ValueError("invalid upstream identifier")
-        if not source_id.startswith(f"{self._SOURCE_PREFIX[kind]}_"):
+        if (
+            not source_id.strip()
+            or len(source_id) > 256
+            or any(unicodedata.category(character) == "Cc" for character in source_id)
+        ):
             raise ValueError("invalid upstream identifier")
         key = (kind, source_id)
         with self._lock:

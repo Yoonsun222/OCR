@@ -2,6 +2,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
@@ -14,6 +15,7 @@ from raglab.observability.events import (
     OpaqueIdRegistry,
     SafeEvent,
 )
+from raglab.security.authorization import AuthorizationGuard, MemoryPolicyStore
 
 
 ID_REGISTRY = OpaqueIdRegistry()
@@ -141,7 +143,7 @@ def test_registry_maps_legacy_ids_stably_without_exposing_source_values(tmp_path
     registry = OpaqueIdRegistry()
     mapped = registry.map(OpaqueIdKind.DOCUMENT, "doc_01")
     assert registry.map(OpaqueIdKind.DOCUMENT, "doc_01") is mapped
-    assert "doc_01" not in repr(mapped)
+    assert mapped.value != "doc_01"
 
     event = SafeEvent(
         EventName.STAGE_FINISHED,
@@ -151,24 +153,58 @@ def test_registry_maps_legacy_ids_stably_without_exposing_source_values(tmp_path
         registry.map(OpaqueIdKind.GENERATION, "gen_01"),
         EventStage.RETRIEVE,
     )
-    assert all(source not in repr(event) for source in ("run_01", "query_01", "doc_01", "gen_01"))
+    source_ids = ("run_01", "query_01", "doc_01", "gen_01")
+    event_ids = (event.run_id.value, event.query_id.value, event.document_id.value, event.generation_id.value)
+    assert all(event_id != source_id for event_id, source_id in zip(event_ids, source_ids, strict=True))
     event_path = tmp_path / "events.jsonl"
     JsonlEventWriter(event_path).write(event)
-    serialized = event_path.read_text(encoding="utf-8")
-    assert all(source not in serialized for source in ("run_01", "query_01", "doc_01", "gen_01"))
+    serialized = json.loads(event_path.read_text(encoding="utf-8"))
+    serialized_ids = tuple(serialized[field] for field in ("run_id", "query_id", "document_id", "generation_id"))
+    assert all(value != source for value, source in zip(serialized_ids, source_ids, strict=True))
 
 
-def test_registry_rejects_encoded_payload_tokens_without_reflecting_them() -> None:
+def test_registry_maps_real_query_pin_identifiers() -> None:
+    store = MemoryPolicyStore()
+    store.allow("user_01", "doc_01", group_hash="g" * 64)
+    pin = AuthorizationGuard.policy_only(store).pin(
+        "user_01", "g" * 64, "doc_01", "doc-v1", "gen_01"
+    )
+    assert UUID(pin.query_snapshot_id).version == 4
+
+    registry = OpaqueIdRegistry()
+    query_id = registry.map(OpaqueIdKind.QUERY, pin.query_snapshot_id)
+    document_id = registry.map(OpaqueIdKind.DOCUMENT, pin.document_id)
+    generation_id = registry.map(OpaqueIdKind.GENERATION, pin.generation_id)
+    assert query_id.value != pin.query_snapshot_id
+    assert document_id.value != pin.document_id
+    assert generation_id.value != pin.generation_id
+
+
+def test_registry_maps_encoded_tokens_without_reflecting_them(tmp_path: Path) -> None:
     encoded_payload = "doc_U2VjcmV0LnBkZg=="
+    registry = OpaqueIdRegistry()
+    mapped = registry.map(OpaqueIdKind.DOCUMENT, encoded_payload)
+    event = SafeEvent(
+        EventName.STAGE_FINISHED,
+        registry.map(OpaqueIdKind.RUN, "run_01"),
+        registry.map(OpaqueIdKind.QUERY, "query_01"),
+        mapped,
+        registry.map(OpaqueIdKind.GENERATION, "gen_01"),
+        EventStage.RETRIEVE,
+    )
+    event_path = tmp_path / "events.jsonl"
+    JsonlEventWriter(event_path).write(event)
+    serialized = json.loads(event_path.read_text(encoding="utf-8"))
+    assert mapped.value != encoded_payload
+    assert serialized["document_id"] == mapped.value
+    assert serialized["document_id"] != encoded_payload
+
+
+@pytest.mark.parametrize("source_id", ["", " \t", "doc_01\n", "doc_01\u0085", "x" * 257])
+def test_registry_rejects_unbounded_or_control_character_ids(source_id: str) -> None:
     with pytest.raises(ValueError) as error:
-        OpaqueIdRegistry().map(OpaqueIdKind.DOCUMENT, encoded_payload)
+        OpaqueIdRegistry().map(OpaqueIdKind.DOCUMENT, source_id)
     assert str(error.value) == "invalid upstream identifier"
-    assert encoded_payload not in str(error.value)
-
-
-def test_registry_rejects_wrong_kind_source_prefix() -> None:
-    with pytest.raises(ValueError, match="invalid upstream identifier"):
-        OpaqueIdRegistry().map(OpaqueIdKind.DOCUMENT, "gen_01")
 
 
 @pytest.mark.parametrize(

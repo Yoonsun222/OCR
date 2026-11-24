@@ -1,0 +1,5 @@
+{
+  "approval_id": "APR-TEST",
+  "expires_at": "2099-01-01T00:00:00Z",
+  "allowed_signer_thumbprints": ["0123456789ABCDEF0123456789ABCDEF01234567"]
+}

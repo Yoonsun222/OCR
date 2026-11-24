@@ -1,20 +1,19 @@
 import json
 import os
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
 
 
-def write_json_atomic(
-    path: Path,
-    value: Mapping[str, object],
-    *,
-    replace: Callable[[Path, Path], None] | None = None,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    serialized = json.dumps(
-        dict(value), ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False
+def serialize_json(value: Mapping[str, object]) -> str:
+    return json.dumps(
+        dict(value), ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False,
     ) + "\n"
+
+
+def write_json_atomic(path: Path, value: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = serialize_json(value)
     temporary_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -30,8 +29,7 @@ def write_json_atomic(
             temporary.write(serialized)
             temporary.flush()
             os.fsync(temporary.fileno())
-        publish = os.replace if replace is None else replace
-        publish(temporary_path, path)
+        os.replace(temporary_path, path)
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)

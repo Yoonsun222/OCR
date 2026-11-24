@@ -256,3 +256,138 @@ def test_report_parent_is_pinned_while_bundle_is_verified(prepared, tmp_path):
         "verify-bundle", "--bundle", str(prepared), "--report", str(output),
     ], catalog_verifier=Catalog(try_move), publisher_authority=Authority(SIGNER)) == 0
     assert output.is_file()
+
+
+def test_approval_is_checked_after_final_inventory(prepared, monkeypatch):
+    from datetime import datetime, timezone
+    from raglab.offline import bundle
+
+    current = datetime(2098, 12, 31, tzinfo=timezone.utc)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, zone=None):
+            return current
+
+    original = bundle._inventory
+
+    def inventory(*args, **kwargs):
+        nonlocal current
+        result = original(*args, **kwargs)
+        if len(args) == 6 and args[5] is not None:
+            current = datetime(2099, 1, 2, tzinfo=timezone.utc)
+        return result
+
+    monkeypatch.setattr(bundle, "datetime", Clock)
+    monkeypatch.setattr(bundle, "_inventory", inventory)
+    report = run(prepared)
+    assert report.status == "BLOCK"
+    assert report.failures[0].code == "RAGLAB-BUNDLE-004"
+
+
+def test_child_added_after_final_nested_scan_blocks(prepared, monkeypatch):
+    from raglab.offline import bundle
+
+    nested = prepared / "first" / "second"
+    nested.mkdir(parents=True)
+    original = bundle._inventory
+
+    def inventory(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if len(args) == 6 and args[5] is not None:
+            (nested / "late.txt").write_bytes(b"unlisted")
+        return result
+
+    monkeypatch.setattr(bundle, "_inventory", inventory)
+    report = run(prepared)
+    assert (nested / "late.txt").is_file()
+    assert report.status == "BLOCK"
+
+
+def test_windows_ordinal_filenames_do_not_use_python_expanding_casefold(prepared):
+    source = prepared / "manifest.json"
+    manifest = json.loads(source.read_text())
+    for name in ("Stra\u00dfe.txt", "STRASSE.txt"):
+        (prepared / name).write_bytes(b"fixture")
+        manifest["artifacts"].append({
+            "path": name,
+            "sha256": hashlib.sha256(b"fixture").hexdigest(),
+            "license_decision": "approved",
+        })
+    source.write_text(json.dumps(manifest))
+    assert run(prepared).status == "PASS"
+
+
+def test_generation_fingerprint_records_original_payload_name_spelling(prepared):
+    before = run(prepared)
+    (prepared / "payload.txt").rename(prepared / "transient.txt")
+    (prepared / "transient.txt").rename(prepared / "PAYLOAD.TXT")
+    after = run(prepared)
+    assert before.status == after.status == "PASS"
+    assert before.generation_fingerprint != after.generation_fingerprint
+
+
+def test_staged_report_handle_excludes_rewrites_and_swaps(prepared, tmp_path, monkeypatch):
+    from raglab.offline.windows_paths import WindowsLocalPaths
+
+    original = getattr(WindowsLocalPaths, "_rename_file", None)
+    attempted = []
+
+    def guard(paths, handle, destination):
+        staged = paths._canonical(handle)
+        with pytest.raises(PermissionError):
+            staged.write_bytes(b'{"status":"FORGED"}')
+        with pytest.raises(PermissionError):
+            staged.rename(staged.with_suffix(".swap"))
+        attempted.append(staged)
+        original(paths, handle, destination)
+
+    monkeypatch.setattr(WindowsLocalPaths, "_rename_file", guard, raising=False)
+    output = tmp_path / "output.json"
+    assert main([
+        "verify-bundle", "--bundle", str(prepared), "--report", str(output),
+    ], catalog_verifier=Catalog(), publisher_authority=Authority(SIGNER)) == 0
+    assert attempted
+    assert json.loads(output.read_text())["status"] == "PASS"
+
+
+def test_ordinal_alias_is_accepted_only_if_it_opens_the_held_file(prepared, monkeypatch):
+    from raglab.offline.windows_paths import WindowsLocalPaths
+
+    (prepared / "payload.txt").rename(prepared / "transient.txt")
+    (prepared / "transient.txt").rename(prepared / "PAYLOAD.TXT")
+    original = WindowsLocalPaths.pin
+
+    def case_sensitive_pin(paths, name, **options):
+        if name.name == "payload.txt":
+            raise FileNotFoundError("simulated case-sensitive namespace")
+        return original(paths, name, **options)
+
+    monkeypatch.setattr(WindowsLocalPaths, "pin", case_sensitive_pin)
+    assert run(prepared).status == "BLOCK"
+
+
+def test_failed_handle_publication_preserves_report_and_cleans_stage(prepared, tmp_path, monkeypatch):
+    from raglab.offline.windows_paths import WindowsLocalPaths
+
+    def fail(*_):
+        raise OSError("synthetic publication failure")
+
+    monkeypatch.setattr(WindowsLocalPaths, "_rename_file", fail)
+    output = tmp_path / "report.json"
+    output.write_bytes(b"previous bytes")
+    assert main([
+        "verify-bundle", "--bundle", str(prepared), "--report", str(output),
+    ], catalog_verifier=Catalog(), publisher_authority=Authority(SIGNER)) == 2
+    assert output.read_bytes() == b"previous bytes"
+    assert list(tmp_path.glob(".raglab-*.tmp")) == []
+
+
+def test_published_report_keeps_full_unicode_name_on_existing_destination(prepared, tmp_path):
+    final = tmp_path / "report \U0001f9ea.json"
+    final.write_bytes(b"previous bytes")
+    assert main([
+        "verify-bundle", "--bundle", str(prepared), "--report", str(final),
+    ], catalog_verifier=Catalog(), publisher_authority=Authority(SIGNER)) == 0
+    assert json.loads(final.read_text())["status"] == "PASS"
+    assert list(tmp_path.glob("report*")) == [final]

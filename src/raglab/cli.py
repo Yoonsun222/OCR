@@ -1,5 +1,4 @@
 import argparse
-import os
 import sys
 from collections.abc import Sequence
 from contextlib import ExitStack
@@ -8,9 +7,10 @@ from pathlib import Path
 from typing import NoReturn
 
 from raglab.offline.bundle import verify_bundle
-from raglab.offline.jsonio import write_json_atomic
+from raglab.offline.jsonio import serialize_json
 from raglab.offline.ports import CatalogVerifier, PublisherAuthority
 from raglab.offline.windows import WindowsCatalogVerifier
+from raglab.offline.windows_names import windows_name_compare
 from raglab.offline.windows_paths import PinnedPath, WindowsLocalPaths
 
 
@@ -32,7 +32,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _check_report_destination(paths: WindowsLocalPaths, source: PinnedPath, output: Path) -> None:
     with paths.pin(output, missing_ok=True, directory_write_sharing=True) as destination:
-        if destination.path.is_relative_to(source.path):
+        source_parts = source.path.parts
+        destination_parts = destination.path.parts
+        if len(destination_parts) >= len(source_parts) and all(
+            windows_name_compare(left, right) == 0
+            for left, right in zip(source_parts, destination_parts)
+        ):
             raise ValueError("bundle or report paths collide")
         if destination.info is not None and (
             destination.info.is_directory
@@ -50,16 +55,7 @@ def _publish_report(paths: WindowsLocalPaths, source: PinnedPath, output: Path, 
         destination = parent.path / output.name
         _check_report_destination(paths, source, destination)
 
-        def replace(temporary: Path, final: Path) -> None:
-            with paths.pin(parent.path, directory_write_sharing=True) as publishing:
-                if publishing.info.file_id != parent.info.file_id:
-                    raise ValueError("report parent changed")
-                protected.close()
-                os.replace(temporary, final)
-                if paths.identity(publishing.handle).file_id != parent.info.file_id:
-                    raise ValueError("report parent changed")
-
-        write_json_atomic(destination, value, replace=replace)
+        paths.publish_report(parent, destination, serialize_json(value).encode("utf-8"), protected.close)
 
 
 def _verify_command(

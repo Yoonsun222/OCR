@@ -2,7 +2,7 @@ import hashlib
 import json
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -16,6 +16,7 @@ from raglab.offline.ports import (
     VerificationLimits,
     normalize_thumbprint,
 )
+from raglab.offline.windows_names import WindowsFilenameIndex, windows_name_compare
 from raglab.offline.windows_paths import PinnedPath, WindowsLocalPaths, path_segment_is_safe
 
 
@@ -88,10 +89,16 @@ def _relative_name(value: object) -> str:
     return "/".join(parts)
 
 
+def _is_control(name: str) -> bool:
+    return any(windows_name_compare(name, control) == 0 for control in _CONTROLS)
+
+
 def _control_code(name: str) -> str:
-    return {"approval.json": _APPROVAL_FAILURE, "bundle.cat": _CATALOG_FAILURE}.get(
-        name, _PATH_FAILURE,
-    )
+    if windows_name_compare(name, "approval.json") == 0:
+        return _APPROVAL_FAILURE
+    if windows_name_compare(name, "bundle.cat") == 0:
+        return _CATALOG_FAILURE
+    return _PATH_FAILURE
 
 
 def _inventory(
@@ -115,23 +122,23 @@ def _inventory(
                 if not path_segment_is_safe(entry.name):
                     raise _BundleBlocked(_PATH_FAILURE, "manifest.json", "unsafe bundle member name")
                 name = prefix + entry.name
-                key = name.casefold()
-                if key in inventory:
+                if name in inventory:
                     raise _BundleBlocked(_PATH_FAILURE, "manifest.json", "duplicate bundle member")
                 try:
                     if previous is None:
                         member = locks.enter_context(paths.pin_entry(directory / entry.name))
                     else:
-                        member = previous[key]
+                        member = previous[name]
                         with paths.pin_entry(directory / entry.name) as current:
                             if current.info != member.info:
                                 raise ValueError("member identity changed")
                 except (KeyError, OSError, ValueError):
-                    raise _BundleBlocked(_control_code(key), name, "unsafe or changed bundle member") from None
+                    raise _BundleBlocked(_control_code(name), name, "unsafe or changed bundle member") from None
                 deadline.check()
-                inventory[key] = member
+                inventory[name] = member
                 if member.info.is_directory:
                     directories.append((member.path, name + "/", depth + 1))
+    WindowsFilenameIndex(inventory)
     if previous is not None and inventory.keys() != previous.keys():
         raise _BundleBlocked(_PATH_FAILURE, "manifest.json", "bundle inventory changed")
     return inventory
@@ -180,13 +187,13 @@ def _parse_manifest(document: dict[str, object], maximum: int) -> dict[str, _Art
         if not isinstance(row, dict):
             raise ValueError("malformed artifact")
         name = _relative_name(row.get("path"))
-        key = name.casefold()
         sha256 = row.get("sha256")
-        if key in artifacts or key in _CONTROLS:
+        if name in artifacts or _is_control(name):
             raise ValueError("duplicate or reserved artifact path")
         if not isinstance(sha256, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
             raise ValueError("invalid artifact digest")
-        artifacts[key] = _Artifact(name, sha256.lower(), row.get("license_decision") == "approved")
+        artifacts[name] = _Artifact(name, sha256.lower(), row.get("license_decision") == "approved")
+    WindowsFilenameIndex(artifacts)
     return artifacts
 
 
@@ -220,12 +227,34 @@ def _sha256(member: PinnedPath, deadline: VerificationDeadline) -> str:
     return digest.hexdigest()
 
 
+def _opens_held_file(
+    supplied: str,
+    actual: str,
+    member: PinnedPath,
+    root: Path,
+    paths: WindowsLocalPaths,
+    deadline: VerificationDeadline,
+) -> bool:
+    if supplied == actual:
+        return True
+    deadline.check()
+    try:
+        with paths.pin(root.joinpath(*supplied.split("/"))) as alias:
+            matches = alias.info.file_id == member.info.file_id
+    except (OSError, ValueError):
+        return False
+    deadline.check()
+    return matches
+
+
 def _catalog_matches(
     decision: CatalogDecision,
     files: Mapping[str, PinnedPath],
-    manifest_digest: str,
-    approval_digest: str,
+    metadata_digests: Mapping[str, str],
     trusted: frozenset[str],
+    root: Path,
+    paths: WindowsLocalPaths,
+    deadline: VerificationDeadline,
 ) -> bool:
     if not isinstance(decision, CatalogDecision) or decision.valid is not True:
         return False
@@ -233,17 +262,20 @@ def _catalog_matches(
         return False
     members: dict[str, str] = {}
     for name, digest in decision.members.items():
-        key = _relative_name(name).casefold()
+        key = _relative_name(name)
         if key in members or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
             return False
         members[key] = digest.lower()
-    return (
-        decision.signer is not None
-        and normalize_thumbprint(decision.signer) in trusted
-        and members.keys() == files.keys()
-        and members.get("manifest.json") == manifest_digest
-        and members.get("approval.json") == approval_digest
-    )
+    member_names = WindowsFilenameIndex(members)
+    if normalize_thumbprint(decision.signer) not in trusted or len(members) != len(files):
+        return False
+    for name, file in files.items():
+        signed_name = member_names.find(name)
+        if signed_name is None or not _opens_held_file(signed_name, name, file, root, paths, deadline):
+            return False
+        if name in metadata_digests and members[signed_name] != metadata_digests[name]:
+            return False
+    return True
 
 
 def _verify_snapshot(
@@ -254,13 +286,18 @@ def _verify_snapshot(
     locks: ExitStack,
     limits: VerificationLimits,
     deadline: VerificationDeadline,
+    require_unchanged: Callable[[], None],
 ) -> BundleReport:
     inventory = _inventory(root.path, paths, locks, limits, deadline)
     files = {
         name: item for name, item in inventory.items() if not item.info.is_directory
     }
-    manifest, manifest_digest = _read_document(files.get("manifest.json"), "manifest.json", limits)
-    approval_document, approval_digest = _read_document(files.get("approval.json"), "approval.json", limits)
+    names = WindowsFilenameIndex(files)
+    manifest_name = names.find("manifest.json") or "manifest.json"
+    approval_name = names.find("approval.json") or "approval.json"
+    manifest, manifest_digest = _read_document(files.get(manifest_name), "manifest.json", limits)
+    approval_document, approval_digest = _read_document(files.get(approval_name), "approval.json", limits)
+    metadata_digests = {manifest_name: manifest_digest, approval_name: approval_digest}
     try:
         artifacts = _parse_manifest(manifest, limits.artifact_count)
     except ValueError:
@@ -277,36 +314,45 @@ def _verify_snapshot(
     if not trusted:
         return _block(_CATALOG_FAILURE, "bundle.cat", "catalog or publisher verification failed")
 
-    catalog = files.pop("bundle.cat", None)
+    catalog_name = names.find("bundle.cat") or "bundle.cat"
+    catalog = files.pop(catalog_name, None)
     if catalog is None or catalog.info.size > limits.catalog_bytes:
         return _block(_CATALOG_FAILURE, "bundle.cat", "missing, unsafe, or oversized catalog")
 
-    payload = files.keys() - _CONTROLS
-    missing = artifacts.keys() - payload
-    extra = payload - artifacts.keys()
-    failures = [
-        BundleFailure(_PATH_FAILURE, artifacts[name].name, "missing payload") for name in sorted(missing)
-    ]
-    if extra:
+    payload = files.keys() - metadata_digests.keys()
+    payload_names = WindowsFilenameIndex(payload)
+    matched: dict[str, _Artifact] = {}
+    failures = []
+    for name, artifact in artifacts.items():
+        actual_name = payload_names.find(name)
+        if actual_name is None or not _opens_held_file(
+            name, actual_name, files[actual_name], root.path, paths, deadline,
+        ):
+            failures.append(BundleFailure(_PATH_FAILURE, artifact.name, "missing payload"))
+        else:
+            matched[actual_name] = artifact
+    if payload - matched.keys():
         failures.append(BundleFailure(_PATH_FAILURE, "manifest.json", "unlisted payload in bundle"))
     if failures:
         return BundleReport("BLOCK", None, tuple(failures))
     if sum(files[name].info.size for name in payload) > limits.payload_bytes:
         return _block(_PATH_FAILURE, "manifest.json", "aggregate payload limit exceeded")
 
-    digests = {"manifest.json": manifest_digest, "approval.json": approval_digest}
-    for name, artifact in artifacts.items():
+    digests = dict(metadata_digests)
+    for name, artifact in matched.items():
         actual = _sha256(files[name], deadline)
         digests[name] = actual
         if actual != artifact.sha256:
             failures.append(BundleFailure(_HASH_FAILURE, artifact.name, "hash mismatch"))
         elif not artifact.license_approved:
             failures.append(BundleFailure(_LICENSE_FAILURE, artifact.name, "license not approved"))
-    digests["bundle.cat"] = _sha256(catalog, deadline)
+    digests[catalog_name] = _sha256(catalog, deadline)
 
     try:
         decision = deadline.call(verifier.verify, catalog, files, deadline)
-        catalog_valid = _catalog_matches(decision, files, manifest_digest, approval_digest, trusted)
+        catalog_valid = _catalog_matches(
+            decision, files, metadata_digests, trusted, root.path, paths, deadline,
+        )
     except Exception:
         catalog_valid = False
     if not catalog_valid:
@@ -324,6 +370,10 @@ def _verify_snapshot(
     generation = hashlib.sha256(
         json.dumps(digests, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii")
     ).hexdigest()
+    require_unchanged()
+    if approval.expires_at <= datetime.now(timezone.utc):
+        expired = BundleFailure(_APPROVAL_FAILURE, "approval.json", "approval expired")
+        return BundleReport("BLOCK", approval.identifier, (expired,))
     return BundleReport("PASS", approval.identifier, (), generation)
 
 
@@ -348,7 +398,8 @@ def verify_bundle(
                     raise ValueError("bundle root is not a directory")
             except (OSError, RuntimeError, ValueError):
                 return _block(_PATH_FAILURE, ".", "missing or invalid local bundle directory")
-            return _verify_snapshot(pinned, verifier, authority, paths, locks, limits, deadline)
+            require_unchanged = locks.enter_context(paths.watch_namespace(pinned))
+            return _verify_snapshot(pinned, verifier, authority, paths, locks, limits, deadline, require_unchanged)
     except _BundleBlocked as blocked:
         return BundleReport("BLOCK", None, (blocked.failure,))
     except (OSError, RuntimeError, ValueError):

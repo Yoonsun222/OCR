@@ -2,6 +2,8 @@ import ctypes
 import ntpath
 import os
 import re
+import uuid
+from collections.abc import Callable
 from contextlib import ExitStack, contextmanager
 from ctypes import wintypes as win
 from dataclasses import dataclass
@@ -15,6 +17,15 @@ _INVALID_HANDLE = ctypes.c_void_p(-1).value
 _FILE_SHARE_READ = 0x00000001
 _FILE_SHARE_WRITE = 0x00000002
 _GENERIC_READ = 0x80000000
+_GENERIC_WRITE = 0x40000000
+_DELETE = 0x00010000
+_CREATE_NEW = 1
+_FILE_LIST_DIRECTORY = 1
+_OVERLAPPED_IO = 0x40000000
+_NAMESPACE_CHANGES = 0x00000007  # File names, directory names, and attributes
+_WAIT_TIMEOUT = 0x00000102
+_FILE_RENAME_INFO = 3
+_FILE_DISPOSITION_INFO = 4
 _OPEN_EXISTING = 3
 _OPEN_REPARSE_POINT = 0x00200000
 _BACKUP_SEMANTICS = 0x02000000
@@ -43,6 +54,20 @@ def path_segment_is_safe(part: str) -> bool:
         or PureWindowsPath(part).is_reserved()
         or any(char in '<>:"|?*/\\' or ord(char) < 32 or 0xD800 <= ord(char) <= 0xDFFF for char in part)
     )
+
+
+class _Overlapped(ctypes.Structure):
+    _fields_ = [
+        ("internal", ctypes.c_void_p), ("high", ctypes.c_void_p),
+        ("offset", win.DWORD), ("offset_high", win.DWORD), ("event", win.HANDLE),
+    ]
+
+
+class _FileRenameInformation(ctypes.Structure):
+    _fields_ = [
+        ("replace", win.DWORD), ("directory", win.HANDLE),
+        ("name_length", win.DWORD), ("name", win.WCHAR * 1),
+    ]
 
 
 class _FileInformation(ctypes.Structure):
@@ -247,3 +272,125 @@ class WindowsLocalPaths:
             if create_directories and not entry.info.is_directory:
                 raise ValueError("report parent is not a directory")
             yield entry
+
+
+    @contextmanager
+    def watch_namespace(self, directory: PinnedPath):
+        # One outstanding recursive Windows notification stays armed from intake
+        # through the final decision. Any completion, including overflow, blocks.
+        create_file = bind(
+            self._kernel, "CreateFileW", win.HANDLE, win.LPCWSTR, win.DWORD,
+            win.DWORD, ctypes.c_void_p, win.DWORD, win.DWORD, win.HANDLE,
+        )
+        close = bind(self._kernel, "CloseHandle", win.BOOL, win.HANDLE)
+        create_event = bind(
+            self._kernel, "CreateEventW", win.HANDLE, ctypes.c_void_p, win.BOOL, win.BOOL, win.LPCWSTR,
+        )
+        watch = bind(
+            self._kernel, "ReadDirectoryChangesW", win.BOOL, win.HANDLE,
+            ctypes.c_void_p, win.DWORD, win.BOOL, win.DWORD,
+            ctypes.c_void_p, ctypes.POINTER(_Overlapped), ctypes.c_void_p,
+        )
+        wait = bind(self._kernel, "WaitForSingleObject", win.DWORD, win.HANDLE, win.DWORD)
+        cancel = bind(
+            self._kernel, "CancelIoEx", win.BOOL, win.HANDLE, ctypes.POINTER(_Overlapped),
+        )
+        completion = bind(
+            self._kernel, "GetOverlappedResult", win.BOOL, win.HANDLE, ctypes.POINTER(_Overlapped),
+            ctypes.POINTER(win.DWORD), win.BOOL,
+        )
+        event = create_event(None, True, False, None)
+        if not event:
+            raise ctypes.WinError(ctypes.get_last_error())
+        handle = None
+        try:
+            handle = create_file(
+                "\\\\?\\" + str(directory.path), _FILE_LIST_DIRECTORY, _FILE_SHARE_READ, None,
+                _OPEN_EXISTING, _OPEN_REPARSE_POINT | _BACKUP_SEMANTICS | _OVERLAPPED_IO, None,
+            )
+            if handle == _INVALID_HANDLE:
+                raise ctypes.WinError(ctypes.get_last_error())
+            if self.identity(handle).file_id != directory.info.file_id:
+                raise ValueError("bundle directory changed")
+            operation = _Overlapped(event=event)
+            buffer = ctypes.create_string_buffer(4096)
+            if not watch(handle, buffer, len(buffer), True, _NAMESPACE_CHANGES, None, ctypes.byref(operation), None):
+                raise ctypes.WinError(ctypes.get_last_error())
+
+            def require_unchanged() -> None:
+                if wait(event, 0) != _WAIT_TIMEOUT:
+                    raise ValueError("bundle namespace changed or notification unavailable")
+
+            try:
+                yield require_unchanged
+            finally:
+                # Keep the I/O buffer and OVERLAPPED alive until completion even
+                # when cancellation races with a filesystem notification.
+                cancel(handle, ctypes.byref(operation))
+                transferred = win.DWORD()
+                completion(handle, ctypes.byref(operation), ctypes.byref(transferred), True)
+        finally:
+            if handle not in {None, _INVALID_HANDLE}:
+                close(handle)
+            close(event)
+
+    def _rename_file(self, handle: int, destination: Path) -> None:
+        set_information = bind(
+            self._kernel, "SetFileInformationByHandle", win.BOOL, win.HANDLE,
+            ctypes.c_int, ctypes.c_void_p, win.DWORD,
+        )
+        name = ("\\\\?\\" + str(destination)).encode("utf-16-le")
+        offset = _FileRenameInformation.name.offset
+        # Win32 reads a terminating WCHAR in addition to the counted name.
+        buffer = ctypes.create_string_buffer(max(ctypes.sizeof(_FileRenameInformation), offset + len(name) + 2))
+        header = _FileRenameInformation.from_buffer(buffer)
+        header.replace = 1
+        header.name_length = len(name)
+        ctypes.memmove(ctypes.addressof(buffer) + offset, name, len(name))
+        if not set_information(handle, _FILE_RENAME_INFO, buffer, len(buffer)):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def publish_report(
+        self, parent: PinnedPath, destination: Path, content: bytes, release_protection: Callable[[], None],
+    ) -> None:
+        create_file = bind(
+            self._kernel, "CreateFileW", win.HANDLE, win.LPCWSTR, win.DWORD,
+            win.DWORD, ctypes.c_void_p, win.DWORD, win.DWORD, win.HANDLE,
+        )
+        close = bind(self._kernel, "CloseHandle", win.BOOL, win.HANDLE)
+        flush = bind(self._kernel, "FlushFileBuffers", win.BOOL, win.HANDLE)
+        write = bind(
+            self._kernel, "WriteFile", win.BOOL, win.HANDLE, ctypes.c_void_p, win.DWORD,
+            ctypes.POINTER(win.DWORD), ctypes.c_void_p,
+        )
+        set_information = bind(
+            self._kernel, "SetFileInformationByHandle", win.BOOL, win.HANDLE,
+            ctypes.c_int, ctypes.c_void_p, win.DWORD,
+        )
+        staged = parent.path / f".raglab-{uuid.uuid4().hex}.tmp"
+        handle = create_file(
+            "\\\\?\\" + str(staged), _GENERIC_READ | _GENERIC_WRITE | _DELETE,
+            0, None, _CREATE_NEW, _OPEN_REPARSE_POINT, None,
+        )
+        if handle == _INVALID_HANDLE:
+            raise ctypes.WinError(ctypes.get_last_error())
+        published = False
+        try:
+            written = win.DWORD()
+            if not write(handle, content, len(content), ctypes.byref(written), None):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if written.value != len(content) or not flush(handle):
+                raise OSError("report write or flush failed")
+            with self.pin(parent.path, directory_write_sharing=True) as publishing:
+                if publishing.info.file_id != parent.info.file_id:
+                    raise ValueError("report parent changed")
+                release_protection()
+                self._rename_file(handle, destination)
+                published = True
+                if self.identity(publishing.handle).file_id != parent.info.file_id:
+                    raise ValueError("report parent changed")
+        finally:
+            if not published:
+                delete = ctypes.c_ubyte(1)
+                set_information(handle, _FILE_DISPOSITION_INFO, ctypes.byref(delete), ctypes.sizeof(delete))
+            close(handle)

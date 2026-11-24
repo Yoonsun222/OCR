@@ -8,6 +8,7 @@ from raglab.offline.ports import (
     VerificationDeadline,
     normalize_thumbprint,
 )
+from raglab.offline.windows_names import WindowsFilenameIndex
 from raglab.offline.windows_paths import PinnedPath, bind, system_dll
 
 
@@ -245,14 +246,19 @@ class _NativeCatalog:
             for _ in range(count * 2 + 1):
                 member = deadline.call(self.next_member, handle, member)
                 if not member:
-                    if compatibility and compatibility != sha256.keys():
-                        raise ValueError("catalog compatibility inventory mismatch")
+                    names = WindowsFilenameIndex(sha256)
+                    if compatibility:
+                        WindowsFilenameIndex(compatibility)
+                        if len(compatibility) != len(sha256) or any(
+                            names.find(name) is None for name in compatibility
+                        ):
+                            raise ValueError("catalog compatibility inventory mismatch")
                     return sha256
                 current = member.contents
                 if current.size != ctypes.sizeof(_CatalogMember) or not current.indirect:
                     raise ValueError("malformed catalog member")
                 indirect = current.indirect.contents
-                key = self._member_name(handle, member, deadline).replace("\\", "/").casefold()
+                key = self._member_name(handle, member, deadline).replace("\\", "/")
                 if indirect.algorithm.oid == _SHA1_OID:
                     if key in compatibility:
                         raise ValueError("duplicate compatibility catalog member")
@@ -276,7 +282,8 @@ class _NativeCatalog:
         members: Mapping[str, str],
         deadline: VerificationDeadline,
     ) -> bool:
-        if files.keys() != members.keys():
+        names = WindowsFilenameIndex(members)
+        if len(files) != len(members) or any(names.find(name) is None for name in files):
             return False
         admin = win.HANDLE()
         deadline.check()
@@ -290,7 +297,7 @@ class _NativeCatalog:
                 size = win.DWORD(len(sha))
                 if not deadline.call(self.calc_hash, admin, member.handle, ctypes.byref(size), sha, 0):
                     return False
-                if size.value != len(sha) or bytes(sha).hex() != members[name]:
+                if size.value != len(sha) or bytes(sha).hex() != members[names.find(name)]:
                     return False
             return True
         finally:

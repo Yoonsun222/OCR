@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 
 from raglab.conformance.synthetic import run_synthetic_conformance
+from raglab.observability.events import EventStage, JsonlEventWriter, SafeEvent
+from raglab.security.authorization import AuthorizationGuard, MemoryPolicyStore
 
 
 def test_synthetic_flow_closes_every_common_gate(tmp_path: Path) -> None:
@@ -48,16 +50,74 @@ def test_synthetic_flow_logs_only_opaque_stage_metrics(tmp_path: Path) -> None:
             assert identifier == events[0][f"{kind}_id"]
 
 
-def test_synthetic_flow_scans_existing_jsonl_fields(tmp_path: Path) -> None:
+@pytest.mark.parametrize("skip_retry_writes", [False, True])
+def test_synthetic_retry_verifies_only_its_own_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, skip_retry_writes: bool,
+) -> None:
     run_synthetic_conformance(tmp_path)
-    path = tmp_path / "events.jsonl"
-    first_line = path.read_text(encoding="utf-8").splitlines()[0]
-    invalid_event = json.loads(first_line)
-    invalid_event["metrics"]["synthetic_content"] = "secret_01"
-    with path.open("a", encoding="utf-8") as log:
-        log.write(json.dumps(invalid_event) + "\n")
+    prior_path = tmp_path / "events.jsonl"
+    prior_events = [json.loads(line) for line in prior_path.read_text(encoding="utf-8").splitlines()]
+    prior_events[0]["metrics"]["candidate_count"] = "secret_01"
+    prior_log = "".join(json.dumps(event) + "\n" for event in prior_events)
+    prior_path.write_text(prior_log, encoding="utf-8")
+
+    if skip_retry_writes:
+        monkeypatch.setattr(JsonlEventWriter, "write", lambda self, event: None)
 
     report = run_synthetic_conformance(tmp_path)
 
     assert report.generation_active
-    assert not report.payload_free_log
+    assert report.payload_free_log is (not skip_retry_writes)
+    assert prior_path.read_text(encoding="utf-8") == prior_log
+    retry_path, = set(tmp_path.glob("*.jsonl")) - {prior_path}
+    retry_lines = retry_path.read_text(encoding="utf-8").splitlines()
+    if skip_retry_writes:
+        assert retry_lines == []
+    else:
+        assert len(retry_lines) == len(prior_events)
+        run_id = json.loads(retry_lines[0])["run_id"]
+        assert run_id != prior_events[0]["run_id"]
+        assert run_id in retry_path.name
+        assert "secret_01" not in retry_lines[0]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("metrics", {"candidate_count": "secret_01"}),
+        ("metrics", {"candidate_count": True}),
+        ("query_id", "query_" + "0" * 32),
+        ("timestamp", "2026-11-24T00:00:00"),
+    ],
+)
+def test_synthetic_flow_checks_persisted_event_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, value: object,
+) -> None:
+    write = JsonlEventWriter.write
+
+    def write_changed_event(writer: JsonlEventWriter, event: SafeEvent) -> None:
+        write(writer, event)
+        if event.stage is EventStage.RETRIEVE:
+            record = json.loads(writer.path.read_text(encoding="utf-8"))
+            record[field] = value
+            line = json.dumps(record, ensure_ascii=True, separators=(",", ":"))
+            writer.path.write_text(line + "\n", encoding="utf-8", newline="\n")
+
+    monkeypatch.setattr(JsonlEventWriter, "write", write_changed_event)
+
+    assert not run_synthetic_conformance(tmp_path).payload_free_log
+
+
+def test_synthetic_flow_requires_the_guard_to_honor_the_tombstone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def policy_only(store: MemoryPolicyStore, _serving_blocked: object) -> AuthorizationGuard:
+        return AuthorizationGuard.policy_only(store)
+
+    monkeypatch.setattr(AuthorizationGuard, "deletion_managed", staticmethod(policy_only))
+
+    report = run_synthetic_conformance(tmp_path)
+
+    assert report.authorized_query
+    assert report.revocation_blocked
+    assert not report.deletion_verified

@@ -2,6 +2,7 @@
 
 import json
 from dataclasses import asdict, dataclass, replace
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 
@@ -35,6 +36,7 @@ from raglab.observability.events import (
     EventName,
     EventStage,
     JsonlEventWriter,
+    OpaqueId,
     OpaqueIdKind,
     OpaqueIdRegistry,
     SafeEvent,
@@ -44,11 +46,6 @@ from raglab.security.authorization import AuthorizationGuard, MemoryPolicyStore,
 
 # Synthetic fixture values are embedded so the installed package needs no test files.
 _ARTIFACT_HASH = "a" * 64
-_EVENT_FIELDS = frozenset({
-    "event_name", "run_id", "query_id", "document_id", "generation_id",
-    "stage", "metrics", "timestamp",
-})
-_SCENARIO_METRICS = frozenset({"candidate_count", "denied_count", "deleted_count"})
 _QUERY_STAGES = (
     EventStage.RETRIEVE,
     EventStage.SOURCE_LOAD,
@@ -113,22 +110,61 @@ def _synthetic_evidence(pin: QueryPin, source_hash: str) -> EvidenceRegionV1:
     )
 
 
-def _log_has_only_allowed_fields(path: Path) -> bool:
-    with path.open(encoding="utf-8") as stream:
-        saw_record = False
-        for line in stream:
-            record = json.loads(line)
-            if not isinstance(record, dict) or record.keys() != _EVENT_FIELDS:
+def _authorization_changed(
+    guard: AuthorizationGuard, pin: QueryPin, stage: EventStage, diagnostic_id: str
+) -> bool:
+    try:
+        guard.check(pin, stage.value, diagnostic_id)
+    except RaglabError as error:
+        if error.code is not ErrorCode.AUTHORIZATION_CHANGED or error.stage != stage.value:
+            raise
+        return True
+    return False
+
+
+def _reserve_log_path(workspace: Path, run_id: OpaqueId) -> Path:
+    path = workspace / "events.jsonl"
+    try:
+        path.touch(exist_ok=False)
+    except FileExistsError:
+        path = workspace / f"events-{run_id.value}.jsonl"
+        path.touch(exist_ok=False)
+    return path
+
+
+def _log_matches_events(path: Path, events: tuple[SafeEvent, ...]) -> bool:
+    with path.open(encoding="utf-8", newline="") as stream:
+        for event in events:
+            line = stream.readline()
+            try:
+                record = json.loads(line)
+                timestamp = record.get("timestamp") if isinstance(record, dict) else None
+                if not isinstance(timestamp, str):
+                    return False
+                parsed_timestamp = datetime.fromisoformat(timestamp)
+            except ValueError:
                 return False
-            metrics = record["metrics"]
-            if not isinstance(metrics, dict) or not metrics.keys() <= _SCENARIO_METRICS:
+            if parsed_timestamp.tzinfo is not UTC or timestamp != parsed_timestamp.isoformat():
                 return False
-            saw_record = True
-    return saw_record
+
+            expected = {
+                "event_name": event.event_name.value,
+                "run_id": event.run_id.value,
+                "query_id": event.query_id.value,
+                "document_id": event.document_id.value,
+                "generation_id": event.generation_id.value,
+                "stage": event.stage.value,
+                "metrics": dict(event.metrics),
+                "timestamp": timestamp,
+            }
+            # Compare the serialized line to check types and reject duplicate fields.
+            if line != json.dumps(expected, ensure_ascii=True, separators=(",", ":")) + "\n":
+                return False
+        return bool(events) and not stream.readline()
 
 
 def run_synthetic_conformance(workspace: Path) -> ConformanceReport:
-    """Run the scenario in a workspace dedicated to this process."""
+    """Run in a process-specific workspace and create a new log on each invocation."""
 
     principal_id = "user_01"
     group_hash = "d" * 64
@@ -174,17 +210,13 @@ def run_synthetic_conformance(workspace: Path) -> ConformanceReport:
         guard.check(pin, stage.value, diagnostic_id)
 
     policy.revoke(document_id)
-    try:
-        guard.check(pin, EventStage.HIGHLIGHT_OPEN.value, diagnostic_id)
-    except RaglabError as error:
-        if (
-            error.code is not ErrorCode.AUTHORIZATION_CHANGED
-            or error.stage != EventStage.HIGHLIGHT_OPEN.value
-        ):
-            raise
-        revocation_blocked = True
-    else:
-        revocation_blocked = False
+    revocation_blocked = _authorization_changed(guard, pin, EventStage.HIGHLIGHT_OPEN, diagnostic_id)
+
+    # Establish a valid policy snapshot so the next denial proves the tombstone gate.
+    policy.allow(principal_id, document_id, group_hash=group_hash)
+    deletion_pin = guard.pin(
+        principal_id, group_hash, document_id, pin.document_version, pin.generation_id, diagnostic_id
+    )
 
     render_backend = MemoryStorageBackend("render")
     index_backend = MemoryStorageBackend("index")
@@ -201,10 +233,13 @@ def run_synthetic_conformance(workspace: Path) -> ConformanceReport:
     receipt = DeletionCoordinator(
         registry, {render_backend.name: render_backend, index_backend.name: index_backend}
     ).delete_document(source_hash)
+    tombstone_blocked = _authorization_changed(
+        guard, deletion_pin, EventStage.RETRIEVE, diagnostic_id
+    )
     deletion_verified = (
         receipt.status is DeletionStatus.DELETED_VERIFIED
         and receipt.deleted_count == 2
-        and serving_blocked(pin.document_id)
+        and tombstone_blocked
     )
 
     identifiers = OpaqueIdRegistry()
@@ -212,7 +247,7 @@ def run_synthetic_conformance(workspace: Path) -> ConformanceReport:
     query_id = identifiers.map(OpaqueIdKind.QUERY, pin.query_snapshot_id)
     log_document_id = identifiers.map(OpaqueIdKind.DOCUMENT, pin.document_id)
     log_generation_id = identifiers.map(OpaqueIdKind.GENERATION, active.generation_id)
-    writer = JsonlEventWriter(workspace / "events.jsonl")
+    writer = JsonlEventWriter(_reserve_log_path(workspace, run_id))
     stage_metrics = (
         (EventStage.RETRIEVE, {"candidate_count": 1}),
         (EventStage.SOURCE_LOAD, {"denied_count": 0}),
@@ -221,11 +256,15 @@ def run_synthetic_conformance(workspace: Path) -> ConformanceReport:
         (EventStage.HIGHLIGHT_OPEN, {"denied_count": int(revocation_blocked)}),
         (EventStage.DELETE, {"deleted_count": receipt.deleted_count}),
     )
-    for stage, metrics in stage_metrics:
-        writer.write(SafeEvent(
+    events = tuple(
+        SafeEvent(
             EventName.STAGE_FINISHED, run_id, query_id, log_document_id, log_generation_id,
             stage, metrics,
-        ))
+        )
+        for stage, metrics in stage_metrics
+    )
+    for event in events:
+        writer.write(event)
 
     return ConformanceReport(
         authorized_query=pin.policy_epoch == 1,
@@ -233,5 +272,5 @@ def run_synthetic_conformance(workspace: Path) -> ConformanceReport:
         generation_active=generation_active,
         revocation_blocked=revocation_blocked,
         deletion_verified=deletion_verified,
-        payload_free_log=_log_has_only_allowed_fields(writer.path),
+        payload_free_log=_log_matches_events(writer.path, events),
     )

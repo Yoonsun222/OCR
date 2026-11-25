@@ -34,6 +34,9 @@ def validate_box(box: Box) -> None:
         BBox(*box)
     except (TypeError, ValueError):
         raise ValueError("normalized box must have positive area inside [0,1]") from None
+    x, y, width, height = box
+    if x + width <= x or y + height <= y:
+        raise ValueError("normalized box must have positive area inside [0,1]")
 
 
 @dataclass(frozen=True, slots=True)

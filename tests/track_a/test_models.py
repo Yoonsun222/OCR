@@ -11,6 +11,12 @@ def test_ocr_token_rejects_invalid_geometry(box) -> None:
         OcrToken("A", "en", box, 1.0)
 
 
+@pytest.mark.parametrize("box", [(.5, .5, 1e-20, .1), (.5, .5, .1, 1e-20)])
+def test_ocr_token_rejects_box_whose_corners_round_together(box) -> None:
+    with pytest.raises(ValueError, match="normalized box"):
+        OcrToken("A", "en", box, 1.0)
+
+
 @pytest.mark.parametrize("polygon", [((0.2, 0.2),) * 3, ((0., 0.), (.5, .5), (1., 1.))])
 def test_target_rejects_zero_area(polygon) -> None:
     with pytest.raises(ValueError, match="positive area"):

@@ -18,6 +18,7 @@ def _contains(point: Point, polygon: tuple[Point, ...]) -> bool:
 
 def _scores(
     tokens: tuple[OcrToken, ...], targets: tuple[TargetRegion, ...],
+    minimum_spatial_score: float,
 ) -> Iterator[GroundingCandidate]:
     centers = []
     for target in targets:
@@ -29,23 +30,27 @@ def _scores(
         label = x + width / 2, y + height / 2
         for target, center_x, center_y in centers:
             distance = hypot(label[0] - center_x, label[1] - center_y)
-            score = .65 * token.confidence + .35 * max(0.0, 1 - distance / .5)
-            if _contains(label, target.polygon):
-                score += .1
-            yield GroundingCandidate(token, target, min(1.0, score))
+            proximity = .35 * max(0.0, 1 - distance / .5)
+            containment = .1 if _contains(label, target.polygon) else 0.0
+            if proximity + containment >= minimum_spatial_score:
+                score = .65 * token.confidence + proximity + containment
+                yield GroundingCandidate(token, target, min(1.0, score))
 
 
 def rank_candidates(
     tokens: tuple[OcrToken, ...], targets: tuple[TargetRegion, ...], limit: int = 3,
+    *, minimum_spatial_score: float = 0.0,
 ) -> tuple[GroundingCandidate, ...]:
     """Rank supported regions while retaining alternatives for the caller's decision."""
     if type(limit) is not int or not 1 <= limit <= 3:
         raise ValueError("limit must be an integer between one and three")
+    if type(minimum_spatial_score) not in (int, float) or not 0 <= minimum_spatial_score <= 1:
+        raise ValueError("minimum spatial score must be between zero and one")
     if not tokens or not targets:
         return ()
     return tuple(nsmallest(
         limit,
-        _scores(tokens, targets),
+        _scores(tokens, targets, minimum_spatial_score),
         key=lambda item: (-item.score, item.target.region_id, item.token.text,
                           item.token.box, item.token.language, item.token.confidence,
                           item.target.polygon, item.target.kind),

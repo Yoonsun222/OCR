@@ -1,8 +1,9 @@
 """Authorize deterministic grounding over an approved immutable artifact."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from raglab.contracts.errors import ErrorCode, RaglabError, RetryAdvice
 from raglab.security.authorization import AuthorizationGuard, QueryPin
@@ -13,6 +14,9 @@ from .models import ArtifactProvenance, GroundingRequest, GroundingResponse, Ocr
 from .ranker import rank_candidates
 
 _MINIMUM_MARGIN = .05
+# A non-contained label must be within about .4 of the normalized target center.
+_MINIMUM_SPATIAL_SCORE = .07
+_ProviderItem = TypeVar("_ProviderItem", OcrToken, TargetRegion)
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,31 +70,45 @@ class GroundingService:
         query = parse_part_query(request.question)
         artifact = self._resolve(request)
 
-        self._guard.check(pin, "source_load", diagnostic_id="track-a-ocr")
-        tokens = matching_tokens(query, self._ocr.read(artifact.data))
+        tokens = matching_tokens(query, self._read(pin, self._ocr.read, artifact.data, "track-a-ocr"))
         if not tokens:
             return self._release(pin, GroundingResponse("PART_ABSENT", (), "no exact visible label matched"))
         if len({token.box for token in tokens}) > 1:
             return self._release(pin, GroundingResponse("ABSTAIN", (), "multiple visible label occurrences"))
 
         token = min(tokens, key=lambda item: (-item.confidence, item.text, item.language))
-        self._guard.check(pin, "source_load", diagnostic_id="track-a-geometry")
-        regions = tuple(dict.fromkeys(self._geometry.read(artifact.data)))
-        ranked = rank_candidates((token,), regions, 2)
-        # The ranker can award .65 for OCR alone. Require a spatial contribution.
-        spatial_baseline = .65 * token.confidence
-        if not ranked or ranked[0].score < self._minimum_score or ranked[0].score <= spatial_baseline:
+        regions = self._read(pin, self._geometry.read, artifact.data, "track-a-geometry")
+        ranked = rank_candidates(
+            (token,), tuple(dict.fromkeys(regions)), 2, minimum_spatial_score=_MINIMUM_SPATIAL_SCORE,
+        )
+        if not ranked or ranked[0].score < self._minimum_score:
             return self._release(pin, GroundingResponse("ABSTAIN", (), "no target met spatial threshold"))
         # Close alternatives are ambiguous, even when only the leader meets the total score threshold.
-        if len(ranked) == 2 and ranked[1].score > spatial_baseline and (
-            ranked[1].score + _MINIMUM_MARGIN >= ranked[0].score
-        ):
+        if len(ranked) == 2 and ranked[1].score + _MINIMUM_MARGIN >= ranked[0].score:
             return self._release(pin, GroundingResponse("ABSTAIN", (), "competing targets have similar scores"))
 
         self._guard.check(pin, "model", diagnostic_id="track-a-evidence")
         item = candidate_to_evidence(ranked[0], artifact.provenance)
         self._guard.check(pin, "highlight_open", diagnostic_id=item.evidence_id)
         return self._release(pin, GroundingResponse("VERIFIED", (item,), "explicit label and target matched"))
+
+    def _read(
+        self, pin: QueryPin, reader: Callable[[bytes], tuple[_ProviderItem, ...]],
+        data: bytes, diagnostic_id: str,
+    ) -> tuple[_ProviderItem, ...]:
+        self._guard.check(pin, "source_load", diagnostic_id=diagnostic_id)
+        try:
+            result = reader(data)
+        except Exception:
+            result = None
+        self._guard.check(pin, "source_load", diagnostic_id=diagnostic_id)
+        if result is None:
+            raise RaglabError(
+                ErrorCode.INVALID_EVIDENCE, "source_load", "artifact provider failed",
+                "evidence from the approved artifact", "no source or result released",
+                RetryAdvice.NEVER, "verify the artifact provider", diagnostic_id,
+            )
+        return result
 
     def _resolve(self, request: GroundingRequest) -> ApprovedArtifact:
         pin, provenance = request.pin, request.provenance

@@ -71,7 +71,10 @@ def test_absent_label_skips_geometry(authorized_artifact, tokens):
 
 
 @pytest.mark.parametrize(
-    "regions", [(), (target(left=.75),), (target(), target("alternative", .21)), (target(), target("tie"))],
+    "regions", [
+        (), (target(left=.75),), (target(left=.53),),
+        (target(), target("alternative", .21)), (target(), target("tie")),
+    ],
 )
 def test_missing_distant_or_ambiguous_targets_abstain(authorized_artifact, regions):
     _, guard, approved, request = authorized_artifact
@@ -179,3 +182,29 @@ def test_revocation_discards_results_and_stops_subsequent_reads(authorized_artif
         geometry.read.assert_not_called()
     if stage == "highlight":
         assert raised.value.stage == "serialize"
+
+
+@pytest.mark.parametrize("provider", ["ocr", "geometry"])
+@pytest.mark.parametrize("revoke", [False, True])
+def test_provider_errors_are_masked_and_authorization_takes_precedence(
+    authorized_artifact, provider, revoke,
+):
+    store, guard, approved, request = authorized_artifact
+    ocr, geometry = providers()
+
+    def fail(_):
+        if revoke:
+            store.revoke("doc")
+        raise OSError("private fixture full path")
+
+    (ocr if provider == "ocr" else geometry).read.side_effect = fail
+    with pytest.raises(RaglabError) as raised:
+        GroundingService(guard, ocr, geometry, resolver=Mock(return_value=approved)).query(request)
+
+    expected = ErrorCode.AUTHORIZATION_CHANGED if revoke else ErrorCode.INVALID_EVIDENCE
+    assert raised.value.code is expected
+    assert raised.value.stage == "source_load"
+    assert raised.value.__context__ is None
+    assert "private fixture" not in repr(raised.value.to_safe_dict())
+    if provider == "ocr":
+        geometry.read.assert_not_called()

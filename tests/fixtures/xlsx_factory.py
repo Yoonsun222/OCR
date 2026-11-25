@@ -68,3 +68,25 @@ def write_native_workbook(path: Path, extra_parts: dict[str, bytes] | None = Non
     }
     parts.update(extra_parts or {})
     return write_xlsx(path, parts)
+
+def write_layout_workbook(path: Path, extra_parts: dict[str, bytes] | None = None) -> Path:
+    sheet = b"""<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+      xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+      <cols><col min="4" max="5" hidden="true"/></cols>
+      <sheetData><row r="3"/><row hidden="1"/></sheetData>
+      <autoFilter ref="A1:C9"/>
+      <mergeCells><mergeCell ref="A1:B1"/></mergeCells>
+      <tableParts count="1"><tablePart r:id="rIdTable"/></tableParts>
+      </worksheet>"""
+    relationships = b"""<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+      <Relationship Id="rIdTable" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/table"
+       Target="../tables/table1.xml"/></Relationships>"""
+    table = b"""<table xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+      id="1" name="Sales" displayName="Sales_Display" ref="A1:C9" totalsRowCount="1"/>"""
+    parts = {
+        "xl/worksheets/data.xml": sheet,
+        "xl/worksheets/_rels/data.xml.rels": relationships,
+        "xl/tables/table1.xml": table,
+    }
+    parts.update(extra_parts or {})
+    return write_native_workbook(path, parts)

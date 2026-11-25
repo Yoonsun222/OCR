@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
-import re
 from xml.etree.ElementTree import Element
 
+from .coordinates import (
+    MAX_COLUMN, XML_WHITESPACE, cell_coordinates, column_name, numbered_rows, positive_index,
+)
 from .errors import InvalidPackage, PackageLimitExceeded
+from .layout import parse_layout
 from .models import CellObservation, SheetObservation, WorkbookObservation
 from .opc import OpcPackage, Relationship
 
@@ -17,13 +20,9 @@ WORKSHEET_REL = f"{REL_TYPE}/worksheet"
 SHARED_STRINGS_REL = f"{REL_TYPE}/sharedStrings"
 WORKBOOK_PART = "xl/workbook.xml"
 SHARED_STRINGS_PART = "xl/sharedStrings.xml"
-CELL_REFERENCE = re.compile(r"([A-Z]{1,3})([1-9][0-9]{0,6})")
 CELL_TYPES = {"b", "d", "e", "inlineStr", "n", "s", "str"}
 SHEET_STATES = {"visible", "hidden", "veryHidden"}
-MAX_ROW = 1_048_576
-MAX_COLUMN = 16_384
 MAX_SHEET_ID = 65_534
-XML_WHITESPACE = " \t\r\n"
 
 
 def _rich_text(node: Element) -> str:
@@ -109,52 +108,22 @@ def _cell(node: Element, reference: str, shared: tuple[str, ...]) -> CellObserva
     return CellObservation(reference, display, numeric, formula, formula_state, kind, node.get("s"))
 
 
-def _index(raw: str, maximum: int, error_message: str) -> int:
-    normalized = raw.strip(XML_WHITESPACE).removeprefix("+").lstrip("0")
-    if not normalized.isascii() or not normalized.isdecimal() or len(normalized) > len(str(maximum)):
-        raise InvalidPackage(error_message)
-    value = int(normalized)
-    if value > maximum:
-        raise InvalidPackage(error_message)
-    return value
-
-
-def _column_index(letters: str) -> int:
-    column = 0
-    for letter in letters:
-        column = column * 26 + ord(letter) - ord("A") + 1
-    return column
-
-
-def _column_name(column: int) -> str:
-    letters = ""
-    while column:
-        column, offset = divmod(column - 1, 26)
-        letters = chr(ord("A") + offset) + letters
-    return letters
-
-
 def _cell_position(raw: str | None, row: int, previous_column: int) -> tuple[int, str]:
     if raw is None:
         column = previous_column + 1
         if column > MAX_COLUMN:
             raise InvalidPackage("cell reference exceeds worksheet bounds")
-        return column, f"{_column_name(column)}{row}"
+        return column, f"{column_name(column)}{row}"
 
-    match = CELL_REFERENCE.fullmatch(raw)
-    if match is None:
-        raise InvalidPackage("invalid cell reference")
-    letters, row_number = match.groups()
-    column = _column_index(letters)
-    if column > MAX_COLUMN or int(row_number) != row:
+    reference_row, column = cell_coordinates(raw)
+    if reference_row != row:
         raise InvalidPackage("cell reference is outside its worksheet row")
     return column, raw
 
 
 def _sheet_cells(
-    package: OpcPackage, part: str, shared: tuple[str, ...], remaining_cells: int,
+    root: Element, shared: tuple[str, ...], remaining_cells: int,
 ) -> dict[str, CellObservation]:
-    root = package.read_xml(part)
     if root.tag != f"{S}worksheet":
         raise InvalidPackage("invalid worksheet part")
     sheet_data = _single_child(root, "sheetData", "duplicate worksheet cell table")
@@ -162,13 +131,7 @@ def _sheet_cells(
     if sheet_data is None:
         return cells
 
-    row = 0
-    for row_element in sheet_data.iterfind(f"{S}row"):
-        explicit_row = row_element.get("r")
-        next_row = row + 1 if explicit_row is None else _index(explicit_row, MAX_ROW, "invalid worksheet row")
-        if next_row < row or next_row > MAX_ROW:
-            raise InvalidPackage("invalid worksheet row order or bounds")
-        row = next_row
+    for row, row_element in numbered_rows(sheet_data.iterfind(f"{S}row")):
         column = 0
         for node in row_element.iterfind(f"{S}c"):
             if len(cells) >= remaining_cells:
@@ -217,7 +180,7 @@ def parse_workbook(package: OpcPackage) -> WorkbookObservation:
         used_relationships.add(relationship_id)
         used_parts.add(rel.target)
 
-        sheet_id = _index(node.get("sheetId", ""), MAX_SHEET_ID, "invalid worksheet metadata")
+        sheet_id = positive_index(node.get("sheetId", ""), MAX_SHEET_ID, "invalid worksheet metadata")
         name = node.get("name", "")
         folded_name = name.casefold()
         state = node.get("state", "visible")
@@ -229,14 +192,16 @@ def parse_workbook(package: OpcPackage) -> WorkbookObservation:
             raise InvalidPackage("invalid worksheet metadata")
         sheet_ids.add(sheet_id)
         sheet_names.add(folded_name)
-        cells = _sheet_cells(package, rel.target, shared, remaining_cells)
+        sheet_root = package.read_xml(rel.target)
+        cells = _sheet_cells(sheet_root, shared, remaining_cells)
         remaining_cells -= len(cells)
-        sheets.append(SheetObservation(
+        sheet = SheetObservation(
             stable_id=f"sheet-{sheet_id}",
             relationship_id=relationship_id,
             name=name,
             state=state,
             part_name=rel.target,
             cells=cells,
-        ))
+        )
+        sheets.append(parse_layout(package, sheet, sheet_root))
     return WorkbookObservation(package.source_hash(), date_system, tuple(sheets))

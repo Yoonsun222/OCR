@@ -20,6 +20,16 @@ class CellObservation:
 
 
 @dataclass(frozen=True)
+class TableObservation:
+    table_id: str
+    name: str
+    display_name: str
+    reference: str
+    header_row_count: int
+    totals_row_count: int
+
+
+@dataclass(frozen=True)
 class SheetObservation:
     stable_id: str
     relationship_id: str
@@ -31,6 +41,7 @@ class SheetObservation:
     hidden_rows: frozenset[int] = frozenset()
     hidden_columns: frozenset[str] = frozenset()
     auto_filter_range: str | None = None
+    tables: tuple[TableObservation, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "cells", MappingProxyType(dict(self.cells)))

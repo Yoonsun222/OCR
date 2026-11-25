@@ -3,7 +3,7 @@ import ntpath
 import os
 import re
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import ExitStack, contextmanager
 from ctypes import wintypes as win
 from dataclasses import dataclass
@@ -474,6 +474,29 @@ class WindowsLocalPaths:
             finally:
                 if not close(handle):
                     raise ctypes.WinError(ctypes.get_last_error())
+
+    def publish_new_files(
+        self, parent: PinnedPath, files: Mapping[str, bytes], release_protection: Callable[[], None],
+    ) -> None:
+        """Stage exclusive writes and publish in order without replacing any file."""
+        close = bind(self._kernel, "CloseHandle", win.BOOL, win.HANDLE)
+        with ExitStack() as handles, ExitStack() as rollback:
+            staged = {}
+            for name, content in files.items():
+                if not path_segment_is_safe(name):
+                    raise ValueError("invalid output file name")
+                handle = self._create_owned_file(parent.path / f".raglab-{uuid.uuid4().hex}.tmp")
+                handles.callback(close, handle)
+                rollback.callback(self._discard_owned_file, handle)
+                self._write_owned_file(handle, content)
+                staged[name] = handle
+            with self.pin(parent.path, directory_write_sharing=True) as publishing:
+                if publishing.info.file_id != parent.info.file_id:
+                    raise ValueError("output directory changed")
+                release_protection()
+                for name, handle in staged.items():
+                    self._rename_file(handle, publishing.path / name, replace=False)
+                rollback.pop_all()
 
     def publish_report(
         self, parent: PinnedPath, destination: Path, content: bytes, release_protection: Callable[[], None],

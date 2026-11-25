@@ -1,0 +1,6 @@
+{
+  "answer": "PART A는 합성 도면 오른쪽에 있습니다.",
+  "bbox": [0.6, 0.3, 0.24, 0.3],
+  "region_id": "part-a",
+  "schema_version": 1
+}

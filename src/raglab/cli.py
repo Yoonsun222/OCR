@@ -10,6 +10,7 @@ from typing import NoReturn
 from uuid import uuid4
 
 from raglab.offline import config as offline_config
+from raglab.offline import demo as offline_demo
 from raglab.offline.bundle import verify_bundle
 from raglab.offline.doctor import (
     CanaryRequest,
@@ -52,6 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--report", type=Path, default=Path("runs/doctor.json"))
     doctor.add_argument("--active-egress-canary", action="store_true")
     doctor.add_argument("--approval-id")
+
+    demo = subparsers.add_parser("demo")
+    demo.add_argument("--profile", choices=offline_config.PROFILES, required=True)
+    demo.add_argument("--doctor-report", type=Path, required=True)
+    demo.add_argument("--output", type=Path)
 
     config = subparsers.add_parser("config")
     config_commands = config.add_subparsers(dest="config_command", required=True)
@@ -251,6 +257,17 @@ def _config_command(args: argparse.Namespace) -> int:
     return config.exit_code
 
 
+def _demo_command(args: argparse.Namespace) -> int:
+    report = offline_demo.read_doctor_report(args.doctor_report)
+    config = offline_config.load_profile_config(args.profile)
+    output = args.output if args.output is not None else Path(config.values.get("output_root", "runs")) / "synthetic-demo"
+    result = offline_demo.run_synthetic_demo(offline_demo.DemoContext(report, output, config))
+    print(result.answer)
+    for name in offline_demo.DEMO_OUTPUTS:
+        print(name)
+    return 0
+
+
 def _traceback_locations(exc: Exception) -> list[dict[str, object]]:
     # Capture the call stack without asking traceback to load or format source.
     package = Path(__file__).parent
@@ -270,6 +287,8 @@ def _write_diagnostic(output: Path, value: dict, args: argparse.Namespace | None
     # All paths produced here are independent of CLI operands. Keep logs outside
     # the shipped configuration and any command input, including the bundle.
     sources = [offline_config.CONFIG_DIRECTORY]
+    if getattr(args, "command", None) == "demo":
+        sources.append(offline_demo.FIXTURE_DIRECTORY)
     for field in ("bundle", "run", "left", "right", "doctor_report"):
         operand = getattr(args, field, None)
         if operand is not None:
@@ -343,6 +362,8 @@ def main(
             return _doctor_command(args, verifier, publisher_authority, system_probe, egress_probe, active_canary)
         if args.command == "config":
             return _config_command(args)
+        if args.command == "demo":
+            return _demo_command(args)
         return 0
     except OperatorError as error:
         return _report_error(error, args)

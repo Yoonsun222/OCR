@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "run_id": "11111111111111111111111111111111",
+  "profile": "local16",
+  "overall_status": "PASS",
+  "checks": [
+    {
+      "check_id": "BUNDLE_APPROVAL",
+      "status": "PASS",
+      "message": "synthetic readiness check",
+      "action": null
+    },
+    {
+      "check_id": "OS_PYTHON",
+      "status": "PASS",
+      "message": "synthetic readiness check",
+      "action": null
+    },
+    {
+      "check_id": "RESOURCE_PROFILE",
+      "status": "PASS",
+      "message": "synthetic readiness check",
+      "action": null
+    },
+    {
+      "check_id": "FREE_DISK",
+      "status": "PASS",
+      "message": "synthetic readiness check",
+      "action": null
+    },
+    {
+      "check_id": "WRITABLE_PATHS",
+      "status": "PASS",
+      "message": "synthetic readiness check",
+      "action": null
+    },
+    {
+      "check_id": "LONG_UNICODE_PATH",
+      "status": "PASS",
+      "message": "synthetic readiness check",
+      "action": null
+    },
+    {
+      "check_id": "CATALOG_SIGNER",
+      "status": "PASS",
+      "message": "synthetic readiness check",
+      "action": null
+    },
+    {
+      "check_id": "DLL_INVENTORY",
+      "status": "PASS",
+      "message": "synthetic readiness check",
+      "action": null
+    },
+    {
+      "check_id": "OFFLINE_EGRESS_POLICY",
+      "status": "PASS",
+      "message": "synthetic readiness check",
+      "action": null
+    },
+    {
+      "check_id": "MODEL_INVENTORY",
+      "status": "PASS",
+      "message": "synthetic readiness check",
+      "action": null
+    },
+    {
+      "check_id": "COORDINATE_ROUND_TRIP",
+      "status": "PASS",
+      "message": "synthetic readiness check",
+      "action": null
+    },
+    {
+      "check_id": "ATOMIC_WRITE_CLEANUP",
+      "status": "PASS",
+      "message": "synthetic readiness check",
+      "action": null
+    },
+    {
+      "check_id": "DERIVATIVE_DELETION",
+      "status": "PASS",
+      "message": "synthetic readiness check",
+      "action": null
+    }
+  ],
+  "generated_at": "2026-11-25T02:00:00+00:00",
+  "generation_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "bundle_approval_expires_at": "2030-01-01T00:00:00+00:00"
+}

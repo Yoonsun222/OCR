@@ -58,7 +58,7 @@ class ProgressEvent:
     status: str
 
 
-def _event_line(event: ProgressEvent) -> bytes:
+def serialize_progress_event(event: ProgressEvent) -> bytes:
     if type(event) is not ProgressEvent or vars(event).keys() != ProgressEvent.__dataclass_fields__.keys():
         raise ValueError("unexpected progress event fields")
     counts = (
@@ -83,7 +83,7 @@ def _last_sequence(stream: BinaryIO) -> int | None:
     while line := stream.readline(_MAX_PROGRESS_LINE_BYTES):
         try:
             row = ProgressEvent(**json.loads(line))
-            if _event_line(row) != line or (previous is not None and row.sequence <= previous):
+            if serialize_progress_event(row) != line or (previous is not None and row.sequence <= previous):
                 raise ValueError("noncanonical or out-of-order progress line")
         except (TypeError, ValueError, RecursionError):
             raise ValueError("invalid existing progress stream") from None
@@ -96,7 +96,7 @@ class JsonlProgressSink:
         self._path = Path(path)
 
     def emit(self, event: ProgressEvent) -> None:
-        line = _event_line(event)
+        line = serialize_progress_event(event)
         with _STREAM_LOCK, WindowsLocalPaths().open_progress_stream(self._path) as stream:
             previous = _last_sequence(stream)
             if previous is not None and event.sequence <= previous:

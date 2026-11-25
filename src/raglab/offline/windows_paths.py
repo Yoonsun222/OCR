@@ -27,6 +27,7 @@ _WAIT_TIMEOUT = 0x00000102
 _FILE_RENAME_INFO = 3
 _FILE_DISPOSITION_INFO = 4
 _OPEN_EXISTING = 3
+_OPEN_ALWAYS = 4
 _OPEN_REPARSE_POINT = 0x00200000
 _BACKUP_SEMANTICS = 0x02000000
 _ATTRIBUTE_DIRECTORY = 0x10
@@ -96,6 +97,7 @@ class FileIdentity:
     size: int
     updated: int
     is_directory: bool
+    link_count: int = 1
 
     @property
     def file_id(self) -> tuple[int, bytes]:
@@ -183,6 +185,7 @@ class WindowsLocalPaths:
             data.size_high << 32 | data.size_low,
             data.updated.dwHighDateTime << 32 | data.updated.dwLowDateTime,
             bool(data.attributes & _ATTRIBUTE_DIRECTORY),
+            int(data.link_count),
         )
 
     def _canonical(self, handle: int) -> Path:
@@ -245,9 +248,49 @@ class WindowsLocalPaths:
                 close(handle)
 
     @contextmanager
+    def open_progress_stream(self, path: Path):
+        """Hold the validated namespace and give one writer exclusive access."""
+        path = self.validate(path)
+        import msvcrt
+
+        from raglab.offline.windows_names import windows_name_compare
+
+        create_file = bind(
+            self._kernel, "CreateFileW", win.HANDLE,
+            win.LPCWSTR, win.DWORD, win.DWORD, ctypes.c_void_p,
+            win.DWORD, win.DWORD, win.HANDLE,
+        )
+        close = bind(self._kernel, "CloseHandle", win.BOOL, win.HANDLE)
+        with self.pin(path.parent, create_directories=True, reject_aliases=True) as parent:
+            destination = parent.path / path.name
+            handle = create_file(
+                "\\\\?\\" + str(destination), _GENERIC_READ | _GENERIC_WRITE,
+                0, None, _OPEN_ALWAYS, _OPEN_REPARSE_POINT, None,
+            )
+            if handle == _INVALID_HANDLE:
+                raise ctypes.WinError(ctypes.get_last_error())
+            try:
+                info = self.identity(handle)
+                if info.is_directory or info.link_count != 1 or windows_name_compare(
+                    str(destination), str(self._canonical(handle)),
+                ) != 0:
+                    raise ValueError("aliased progress file is unavailable")
+                descriptor = msvcrt.open_osfhandle(handle, os.O_RDWR | os.O_BINARY)
+            except BaseException:
+                close(handle)
+                raise
+            try:
+                stream = os.fdopen(descriptor, "r+b", buffering=0)
+            except BaseException:
+                os.close(descriptor)
+                raise
+            with stream:
+                yield stream
+
+    @contextmanager
     def pin(
         self, path: Path, *, missing_ok: bool = False, create_directories: bool = False,
-        directory_write_sharing: bool = False,
+        directory_write_sharing: bool = False, reject_aliases: bool = False,
     ):
         # Validate before calling this method. Pin one segment at a time so
         # opening a child cannot traverse an unverified ancestor.
@@ -269,6 +312,11 @@ class WindowsLocalPaths:
                         return
                     else:
                         raise
+                if reject_aliases:
+                    from raglab.offline.windows_names import windows_name_compare
+
+                    if windows_name_compare(str(entry.path), str(child)) != 0:
+                        raise ValueError("aliased path component is unavailable")
             if create_directories and not entry.info.is_directory:
                 raise ValueError("report parent is not a directory")
             yield entry

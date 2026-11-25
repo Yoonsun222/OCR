@@ -220,9 +220,12 @@ def read_config_json(path: Path) -> dict[str, object]:
             content = source.read(_MAX_CONFIG_BYTES + 1)
         if len(content) > _MAX_CONFIG_BYTES:
             raise ValueError("configuration JSON exceeds the size limit")
-    value = json.loads(
-        content.decode("utf-8-sig"), object_pairs_hook=_unique_object, parse_constant=_invalid_constant,
-    )
+    try:
+        value = json.loads(
+            content.decode("utf-8-sig"), object_pairs_hook=_unique_object, parse_constant=_invalid_constant,
+        )
+    except RecursionError:
+        raise ValueError("configuration JSON nesting exceeds the parser limit") from None
     if not isinstance(value, dict):
         raise ValueError("configuration JSON must be an object")
     return value

@@ -90,3 +90,12 @@ def test_internal_diagnostics_never_write_inside_source_bundle(monkeypatch, tmp_
     assert "Diagnostics unavailable" in err
     assert str(bundle) not in err
     assert list(bundle.iterdir()) == []
+
+
+def test_config_diff_rejects_recursion_limit_as_operator_input(tmp_path, capsys):
+    nested = tmp_path / "nested.json"
+    nested.write_text('{"values":' + "[" * 2000 + "0" + "]" * 2000 + "}", encoding="utf-8")
+    assert cli.main(["config", "diff", "--left", str(nested), "--right", str(nested)]) == 2
+    err = capsys.readouterr().err
+    assert "RAGLAB-INPUT-001" in err
+    assert str(nested) not in err

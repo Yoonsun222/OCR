@@ -6,6 +6,8 @@ from pathlib import Path
 from threading import Lock
 from typing import BinaryIO
 
+from raglab.offline.windows_paths import WindowsLocalPaths
+
 
 FORBIDDEN_FIELDS = frozenset({
     "document_name", "document_path", "document_text", "ocr_text",
@@ -56,23 +58,37 @@ class ProgressEvent:
     status: str
 
 
+def _event_line(event: ProgressEvent) -> bytes:
+    if type(event) is not ProgressEvent or vars(event).keys() != ProgressEvent.__dataclass_fields__.keys():
+        raise ValueError("unexpected progress event fields")
+    counts = (
+        event.sequence, event.completed, event.total, event.elapsed_ms,
+        event.peak_working_set_bytes, event.retry_count,
+    )
+    if type(event.schema_version) is not int or event.schema_version != 1 or any(
+        type(count) is not int or not 0 <= count <= 2**64 - 1 for count in counts
+    ) or event.completed > event.total:
+        raise ValueError("invalid numeric progress field")
+    if any(type(value) is not str or not _IDENTIFIER.fullmatch(value) for value in (
+        event.run_id, event.stage, event.status,
+    )):
+        raise ValueError("progress identifiers must be opaque")
+    payload = Redactor().redact(asdict(event))
+    line = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return (line + "\n").encode("utf-8")
+
+
 def _last_sequence(stream: BinaryIO) -> int | None:
-    end = stream.seek(0, 2)
-    if not end:
-        return None
-    stream.seek(end - 1)
-    if stream.read(1) != b"\n":
-        raise ValueError("incomplete progress stream")
-    offset = max(0, end - _MAX_PROGRESS_LINE_BYTES)
-    stream.seek(offset)
-    tail = stream.read()
-    _, separator, last = tail[:-1].rpartition(b"\n")
-    if offset and not separator:
-        raise ValueError("invalid progress line")
-    row = json.loads(last)
-    if not isinstance(row, dict) or type(row.get("sequence")) is not int:
-        raise ValueError("invalid progress sequence")
-    return row["sequence"]
+    previous = None
+    while line := stream.readline(_MAX_PROGRESS_LINE_BYTES):
+        try:
+            row = ProgressEvent(**json.loads(line))
+            if _event_line(row) != line or (previous is not None and row.sequence <= previous):
+                raise ValueError("noncanonical or out-of-order progress line")
+        except (TypeError, ValueError, RecursionError):
+            raise ValueError("invalid existing progress stream") from None
+        previous = row.sequence
+    return previous
 
 
 class JsonlProgressSink:
@@ -80,26 +96,15 @@ class JsonlProgressSink:
         self._path = Path(path)
 
     def emit(self, event: ProgressEvent) -> None:
-        if type(event) is not ProgressEvent or vars(event).keys() != ProgressEvent.__dataclass_fields__.keys():
-            raise ValueError("unexpected progress event fields")
-        counts = (
-            event.sequence, event.completed, event.total, event.elapsed_ms,
-            event.peak_working_set_bytes, event.retry_count,
-        )
-        if type(event.schema_version) is not int or event.schema_version != 1 or any(
-            type(count) is not int or not 0 <= count <= 2**64 - 1 for count in counts
-        ) or event.completed > event.total:
-            raise ValueError("invalid numeric progress field")
-        if any(type(value) is not str or not _IDENTIFIER.fullmatch(value) for value in (
-            event.run_id, event.stage, event.status,
-        )):
-            raise ValueError("progress identifiers must be opaque")
-        payload = Redactor().redact(asdict(event))
-        line = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
-        with _STREAM_LOCK:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            with self._path.open("a+b") as stream:
-                previous = _last_sequence(stream)
-                if previous is not None and event.sequence <= previous:
-                    raise ValueError("progress sequence must strictly increase")
-                stream.write((line + "\n").encode("utf-8"))
+        line = _event_line(event)
+        with _STREAM_LOCK, WindowsLocalPaths().open_progress_stream(self._path) as stream:
+            previous = _last_sequence(stream)
+            if previous is not None and event.sequence <= previous:
+                raise ValueError("progress sequence must strictly increase")
+            position = stream.tell()
+            try:
+                if stream.write(line) != len(line):
+                    raise OSError("incomplete progress write")
+            except OSError:
+                stream.truncate(position)
+                raise

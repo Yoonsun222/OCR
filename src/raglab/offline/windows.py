@@ -1,15 +1,25 @@
 import ctypes
-from collections.abc import Mapping
+import json
+import os
+import shutil
+import subprocess
+import sys
+from collections.abc import Callable, Mapping
+from contextlib import ExitStack
 from ctypes import wintypes as win
-from uuid import UUID
+from pathlib import Path
+from uuid import UUID, uuid4
 
+from raglab.offline.config import EffectiveConfig
 from raglab.offline.ports import (
     CatalogDecision,
+    EgressPolicy,
+    SystemSnapshot,
     VerificationDeadline,
     normalize_thumbprint,
 )
-from raglab.offline.windows_names import WindowsFilenameIndex
-from raglab.offline.windows_paths import PinnedPath, bind, system_dll
+from raglab.offline.windows_names import WindowsFilenameIndex, windows_name_compare
+from raglab.offline.windows_paths import PinnedPath, WindowsLocalPaths, bind, system_dll
 
 
 _POLICY_KEY = r"SOFTWARE\Policies\RagLab\OfflineToolkit"
@@ -324,3 +334,301 @@ class WindowsCatalogVerifier:
         except (OSError, ValueError):
             return failure
         return CatalogDecision(True, signer, None, members)
+
+
+_POWERSHELL_SETUP = r"""
+$ErrorActionPreference = 'Stop'
+$WarningPreference = 'SilentlyContinue'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$env:PSModulePath = Join-Path $PSHOME 'Modules'
+if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) {
+    throw 'Unsupported Windows PowerShell'
+}
+"""
+_SYSTEM_SCRIPT = _POWERSHELL_SETUP + r"""
+$os = CimCmdlets\Get-CimInstance -ClassName Win32_OperatingSystem
+$physical = [uint64]0
+foreach ($module in @(CimCmdlets\Get-CimInstance -ClassName Win32_PhysicalMemory)) {
+    $physical += [uint64]$module.Capacity
+}
+$result = @{
+    supported = [bool]($os.ProductType -eq 1 -and $os.Version -match '^10\.0\.[0-9]+$')
+    physical_bytes = $physical
+    available_bytes = [uint64]$os.FreePhysicalMemory * 1024
+}
+$result | ConvertTo-Json -Compress
+"""
+_FIREWALL_SCRIPT = _POWERSHELL_SETUP + r"""
+$profiles = @(NetSecurity\Get-NetFirewallProfile -PolicyStore ActiveStore)
+$rules = @(NetSecurity\Get-NetFirewallRule -PolicyStore ActiveStore)
+$ipsec = @(NetSecurity\Get-NetIPsecRule -PolicyStore ActiveStore)
+$connections = @(NetConnection\Get-NetConnectionProfile)
+$required = @('Domain', 'Private', 'Public')
+$blocked = @($profiles | Where-Object { $_.Enabled -eq 'True' -and $_.DefaultOutboundAction -eq 'Block' })
+$allNames = @($profiles | ForEach-Object { $_.Name } | Sort-Object)
+if ($profiles.Count -ne 3 -or ($allNames -join ',') -ne ($required -join ',')) {
+    throw 'Effective firewall profiles unavailable'
+}
+if ($rules.Count -eq 0 -or @($rules | Where-Object {
+    $_.Enabled -notin @('True', 'False') -or $_.Direction -notin @('Inbound', 'Outbound') -or
+    $_.Action -notin @('Allow', 'Block')
+}).Count -ne 0) {
+    throw 'Effective firewall rules unavailable'
+}
+$result = @{
+    firewall_services_running = [bool](
+        (Get-Service -Name 'MpsSvc').Status -eq 'Running' -and
+        (Get-Service -Name 'BFE').Status -eq 'Running'
+    )
+    policy_exemptions_absent = [bool](
+        @($profiles | Where-Object { @($_.DisabledInterfaceAliases | Where-Object { $_ }).Count -ne 0 }).Count -eq 0 -and
+        @($ipsec | Where-Object { $_.Enabled -ne 'False' }).Count -eq 0
+    )
+    default_deny_profiles = $blocked.Count
+    enabled_outbound_allows = @($rules | Where-Object {
+        $_.Enabled -eq 'True' -and $_.Direction -eq 'Outbound' -and $_.Action -eq 'Allow'
+    }).Count
+    active_profiles_known = [bool](@($connections | Where-Object {
+        $_.NetworkCategory -notin @('DomainAuthenticated', 'Private', 'Public')
+    }).Count -eq 0)
+}
+$result | ConvertTo-Json -Compress
+"""
+_PROXY_VARIABLES = frozenset({
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY", "WS_PROXY", "WSS_PROXY",
+})
+_GIB = 1024**3
+
+
+def _system_directory() -> Path:
+    query = bind(system_dll("kernel32.dll"), "GetSystemDirectoryW", win.UINT, win.LPWSTR, win.UINT)
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = query(buffer, len(buffer))
+    if not 0 < length < len(buffer):
+        raise OSError("trusted system directory unavailable")
+    return Path(buffer.value)
+
+
+def _unique_probe_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    fields = {}
+    for name, value in pairs:
+        if name in fields:
+            raise ValueError("duplicate probe field")
+        fields[name] = value
+    return fields
+
+
+def _invalid_probe_constant(_value: str) -> None:
+    raise ValueError("invalid probe number")
+
+
+def _powershell_json(script: str) -> dict[str, object]:
+    if script not in (_SYSTEM_SCRIPT, _FIREWALL_SCRIPT):
+        raise ValueError("unknown local probe")
+    system = _system_directory()
+    powershell = system / "WindowsPowerShell" / "v1.0"
+    result = subprocess.run(
+        [str(powershell / "powershell.exe"), "-NoProfile", "-NonInteractive", "-Command", script],
+        cwd=system,
+        env={
+            "SystemRoot": str(system.parent),
+            "WINDIR": str(system.parent),
+            "PATH": str(system),
+            "PSModulePath": str(powershell / "Modules"),
+        },
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    if result.returncode != 0 or result.stderr or len(result.stdout) > 16 * 1024:
+        raise ValueError("Windows PowerShell probe failed")
+    document = json.loads(
+        result.stdout.decode("utf-8-sig"),
+        object_pairs_hook=_unique_probe_object,
+        parse_constant=_invalid_probe_constant,
+    )
+    if not isinstance(document, dict):
+        raise ValueError("Windows PowerShell probe returned an invalid object")
+    return document
+
+
+class _WinHttpProxy(ctypes.Structure):
+    _fields_ = [("access_type", win.DWORD), ("proxy", ctypes.c_void_p), ("bypass", ctypes.c_void_p)]
+
+
+class _WinInetProxy(ctypes.Structure):
+    _fields_ = [
+        ("auto_detect", win.BOOL), ("auto_config_url", ctypes.c_void_p),
+        ("proxy", ctypes.c_void_p), ("bypass", ctypes.c_void_p),
+    ]
+
+
+def _advanced_winhttp_proxy_is_direct() -> bool:
+    system = _system_directory()
+    result = subprocess.run(
+        [str(system / "netsh.exe"), "winhttp", "show", "advproxy"],
+        cwd=system,
+        env={"SystemRoot": str(system.parent), "WINDIR": str(system.parent), "PATH": str(system)},
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    if result.returncode != 0 or result.stderr or len(result.stdout) > 16 * 1024:
+        return False
+    start = result.stdout.find(b"{")
+    if start < 0:
+        return False
+    # The heading is localized. The machine-readable settings object is JSON.
+    settings = json.loads(
+        result.stdout[start:].decode("utf-8"),
+        object_pairs_hook=_unique_probe_object,
+        parse_constant=_invalid_probe_constant,
+    )
+    flags = {"ProxyIsEnabled", "AutoConfigIsEnabled", "AutoDetect"}
+    return (
+        isinstance(settings, dict)
+        and flags <= settings.keys() <= flags | {"PerUserProxySettings"}
+        and all(settings[name] is False for name in flags)
+        and type(settings.get("PerUserProxySettings")) is bool
+    )
+
+
+def _windows_proxy_is_direct() -> bool:
+    # Read stored settings only. No PAC resolution, WPAD, DNS, or connectivity test.
+    http = system_dll("winhttp.dll")
+    free = bind(system_dll("kernel32.dll"), "GlobalFree", win.HGLOBAL, win.HGLOBAL)
+    get_default = bind(http, "WinHttpGetDefaultProxyConfiguration", win.BOOL, ctypes.POINTER(_WinHttpProxy))
+    get_user = bind(http, "WinHttpGetIEProxyConfigForCurrentUser", win.BOOL, ctypes.POINTER(_WinInetProxy))
+    default = _WinHttpProxy()
+    user = _WinInetProxy()
+    try:
+        return bool(
+            get_default(ctypes.byref(default))
+            and default.access_type == 1  # WINHTTP_ACCESS_TYPE_NO_PROXY
+            and not (default.proxy or default.bypass)
+            and get_user(ctypes.byref(user))
+            and not (user.auto_detect or user.auto_config_url or user.proxy or user.bypass)
+            and _advanced_winhttp_proxy_is_direct()
+        )
+    finally:
+        for pointer in (default.proxy, default.bypass, user.auto_config_url, user.proxy, user.bypass):
+            if pointer:
+                free(pointer)
+
+
+class WindowsEgressPolicyProbe:
+    def inspect(self) -> EgressPolicy:
+        try:
+            policy = _powershell_json(_FIREWALL_SCRIPT)
+            denied = (
+                policy.get("firewall_services_running") is True
+                and type(policy.get("default_deny_profiles")) is int and policy["default_deny_profiles"] == 3
+                and type(policy.get("enabled_outbound_allows")) is int and policy["enabled_outbound_allows"] == 0
+                and policy.get("active_profiles_known") is True
+                and policy.get("policy_exemptions_absent") is True
+                and not any(key.upper() in _PROXY_VARIABLES and value for key, value in os.environ.items())
+                and _windows_proxy_is_direct()
+            )
+        except (OSError, ValueError, RecursionError, subprocess.SubprocessError):
+            denied = False
+        return EgressPolicy("DENIED" if denied else "UNKNOWN")
+
+
+def _is_within(candidate: Path, protected: Path) -> bool:
+    return len(candidate.parts) >= len(protected.parts) and all(
+        windows_name_compare(left, right) == 0 for left, right in zip(candidate.parts, protected.parts)
+    )
+
+
+def _extended(path: Path) -> Path:
+    return Path("\\\\?\\" + str(path))
+
+
+def _smoke_check(operation: Callable[[], bool]) -> bool:
+    try:
+        return operation()
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+class WindowsSystemProbe:
+    def __init__(
+        self,
+        config: EffectiveConfig,
+        paths: WindowsLocalPaths,
+        protected: tuple[Path, ...] = (),
+    ):
+        self.config = config
+        self.paths = paths
+        self.protected = protected
+
+    def _working_root(self, key: str) -> Path:
+        configured = self.config.values.get(key)
+        if not isinstance(configured, str):
+            raise ValueError("missing local working path")
+        path = self.paths.validate(configured)
+        with self.paths.pin(path, missing_ok=True, directory_write_sharing=True) as resolved:
+            if any(_is_within(resolved.path, root) for root in self.protected):
+                raise ValueError("working path collides with a protected path")
+            return resolved.path
+
+    def _round_trip(self, root: Path, name: str, *, atomic: bool = False) -> bool:
+        # Only a fresh, randomly named directory and fixed synthetic bytes are used.
+        with self.paths.pin(root, create_directories=True) as directory:
+            if any(_is_within(directory.path, protected) for protected in self.protected):
+                raise ValueError("working path collides with a protected path")
+            scratch = directory.path / f".raglab-doctor-{uuid4().hex}"
+            _extended(scratch).mkdir()
+        candidate = scratch / name
+        data = b'{"synthetic":true}\n'
+        try:
+            if atomic:
+                with ExitStack() as locks:
+                    parent = locks.enter_context(self.paths.pin(scratch))
+                    self.paths.publish_report(parent, candidate, data, locks.close)
+            else:
+                with self.paths.pin(scratch):
+                    with _extended(candidate).open("xb") as target:
+                        target.write(data)
+                        target.flush()
+                        os.fsync(target.fileno())
+            with self.paths.pin(candidate) as reopened:
+                if reopened.read_bytes(len(data)) != data:
+                    return False
+                if not atomic and name != "probe.json" and len(str(reopened.path)) <= 260:
+                    return False
+            with self.paths.pin(scratch, directory_write_sharing=True):
+                _extended(candidate).unlink()
+                return not any(_extended(scratch).iterdir())
+        finally:
+            with self.paths.pin(scratch, directory_write_sharing=True):
+                _extended(candidate).unlink(missing_ok=True)
+            _extended(scratch).rmdir()
+
+    def snapshot(self) -> SystemSnapshot:
+        try:
+            system = _powershell_json(_SYSTEM_SCRIPT)
+        except (OSError, ValueError, RecursionError, subprocess.SubprocessError):
+            system = {}
+        physical, available = system.get("physical_bytes"), system.get("available_bytes")
+        try:
+            roots = tuple(self._working_root(key) for key in ("temp_root", "cache_root", "output_root"))
+            free_disk = min(shutil.disk_usage(root.anchor).free for root in roots) / _GIB
+        except (OSError, ValueError, RuntimeError):
+            roots, free_disk = (), None
+
+        writable = long_unicode = atomic = deleted = False
+        if roots:
+            writable = all(_smoke_check(lambda: self._round_trip(root, "probe.json")) for root in roots)
+            long_name = "합성 日本語 " + "x" * 220 + ".json"
+            long_unicode = _smoke_check(lambda: self._round_trip(roots[0], long_name))
+            atomic = _smoke_check(lambda: self._round_trip(roots[2], "probe.json", atomic=True))
+            deleted = _smoke_check(lambda: self._round_trip(roots[0], "probe.json"))
+        return SystemSnapshot(
+            system.get("supported") is True,
+            (sys.version_info.major, sys.version_info.minor),
+            physical / _GIB if type(physical) is int and 0 < physical <= 2**64 else None,
+            available / _GIB if type(available) is int and 0 < available <= 2**64 else None,
+            free_disk, writable, long_unicode, atomic, deleted,
+        )

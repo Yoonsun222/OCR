@@ -10,9 +10,18 @@ from typing import NoReturn
 
 from raglab.offline import config as offline_config
 from raglab.offline.bundle import verify_bundle
+from raglab.offline.doctor import (
+    CanaryRequest,
+    DoctorContext,
+    VerifiedBundleEvidence,
+    inspect_verified_bundle,
+    run_doctor,
+)
 from raglab.offline.jsonio import serialize_json, write_json_atomic
-from raglab.offline.ports import CatalogVerifier, PublisherAuthority
-from raglab.offline.windows import WindowsCatalogVerifier
+from raglab.offline.ports import (
+    ActiveEgressCanary, CatalogVerifier, EgressPolicyProbe, PublisherAuthority, SystemProbe,
+)
+from raglab.offline.windows import WindowsCatalogVerifier, WindowsEgressPolicyProbe, WindowsSystemProbe
 from raglab.offline.windows_names import windows_name_compare
 from raglab.offline.windows_paths import PinnedPath, WindowsLocalPaths
 
@@ -30,6 +39,14 @@ def build_parser() -> argparse.ArgumentParser:
     verify = subparsers.add_parser("verify-bundle")
     verify.add_argument("--bundle", type=Path, required=True)
     verify.add_argument("--report", type=Path, default=Path("runs/verify-bundle.json"))
+
+    doctor = subparsers.add_parser("doctor")
+    doctor.add_argument("--bundle", type=Path, required=True)
+    doctor.add_argument("--profile", choices=offline_config.PROFILES, required=True)
+    doctor.add_argument("--offline", action="store_true", required=True)
+    doctor.add_argument("--report", type=Path, default=Path("runs/doctor.json"))
+    doctor.add_argument("--active-egress-canary", action="store_true")
+    doctor.add_argument("--approval-id")
 
     config = subparsers.add_parser("config")
     config_commands = config.add_subparsers(dest="config_command", required=True)
@@ -100,6 +117,61 @@ def _verify_command(
     return report.exit_code
 
 
+def _doctor_command(
+    args: argparse.Namespace,
+    verifier: CatalogVerifier,
+    authority: PublisherAuthority | None,
+    system: SystemProbe | None,
+    egress: EgressPolicyProbe | None,
+    canary: ActiveEgressCanary | None,
+) -> int:
+    paths = WindowsLocalPaths()
+    observations: list[VerifiedBundleEvidence] = []
+
+    def observe(files, fingerprint, deadline):
+        observations.append(inspect_verified_bundle(files, fingerprint, deadline))
+
+    try:
+        bundle = paths.validate(args.bundle)
+        output = paths.validate(args.report)
+        config_directory = paths.validate(offline_config.CONFIG_DIRECTORY)
+        with ExitStack() as pins:
+            source = pins.enter_context(paths.pin(bundle, missing_ok=True, directory_write_sharing=True))
+            parent = pins.enter_context(paths.pin(output.parent, missing_ok=True, directory_write_sharing=True))
+            config_root = pins.enter_context(paths.pin(
+                config_directory, missing_ok=True, directory_write_sharing=True,
+            ))
+            destination = parent.path / output.name
+            _check_report_destination(paths, source, destination)
+            _check_report_destination(paths, config_root, destination)
+            bundle_report = verify_bundle(
+                source.path, verifier, publisher_authority=authority, local_paths=paths,
+                observe_verified_payload=observe,
+            )
+            config = offline_config.load_profile_config(args.profile)
+            context = DoctorContext(
+                system if system is not None else WindowsSystemProbe(
+                    config, paths, (source.path, config_root.path),
+                ),
+                egress if egress is not None else WindowsEgressPolicyProbe(),
+                bundle_report, config,
+                observations[0] if observations else None,
+                CanaryRequest(args.active_egress_canary, args.approval_id, canary),
+            )
+            report = run_doctor(context)
+            _publish_report(paths, source, destination, asdict(report))
+    except (OSError, RuntimeError, ValueError):
+        print("Invalid local doctor input or report destination.", file=sys.stderr)
+        return 2
+
+    for check in report.checks:
+        print(f"{check.status:5} {check.check_id:23} {check.message}")
+    if report.overall_status == "BLOCK":
+        print("ACTION Review the doctor report; execution remains blocked.")
+        return 5
+    return 0
+
+
 def _write_config_explanation(
     profile: str, run: Path | None, output: Path,
 ) -> offline_config.EffectiveConfig:
@@ -161,6 +233,9 @@ def main(
     *,
     catalog_verifier: CatalogVerifier | None = None,
     publisher_authority: PublisherAuthority | None = None,
+    system_probe: SystemProbe | None = None,
+    egress_probe: EgressPolicyProbe | None = None,
+    active_canary: ActiveEgressCanary | None = None,
 ) -> int:
     parser = build_parser()
     try:
@@ -170,6 +245,9 @@ def main(
     if args.command == "verify-bundle":
         verifier = catalog_verifier if catalog_verifier is not None else WindowsCatalogVerifier()
         return _verify_command(args.bundle, args.report, verifier, publisher_authority)
+    if args.command == "doctor":
+        verifier = catalog_verifier if catalog_verifier is not None else WindowsCatalogVerifier()
+        return _doctor_command(args, verifier, publisher_authority, system_probe, egress_probe, active_canary)
     if args.command == "config":
         return _config_command(args)
     return 0

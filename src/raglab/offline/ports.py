@@ -2,7 +2,7 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from time import monotonic
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 if TYPE_CHECKING:
     from raglab.offline.windows_paths import PinnedPath
@@ -51,6 +51,38 @@ class CatalogVerifier(Protocol):
         deadline: VerificationDeadline,
     ) -> CatalogDecision:
         """Authenticate the catalog and every held file, returning signed SHA-256 members."""
+        ...
+
+
+@dataclass(frozen=True)
+class SystemSnapshot:
+    supported_os: bool
+    python_version: tuple[int, int]
+    physical_ram_gib: float | None
+    available_ram_gib: float | None
+    free_disk_gib: float | None
+    paths_writable: bool
+    long_unicode_path: bool
+    atomic_write_cleanup: bool
+    derivative_deleted: bool
+
+
+@dataclass(frozen=True)
+class EgressPolicy:
+    status: Literal["DENIED", "UNKNOWN"]
+
+
+class SystemProbe(Protocol):
+    def snapshot(self) -> SystemSnapshot: ...
+
+
+class EgressPolicyProbe(Protocol):
+    def inspect(self) -> EgressPolicy: ...
+
+
+class ActiveEgressCanary(Protocol):
+    def verify_denied(self, endpoint: str, approval_id: str) -> bool:
+        """Observe an approved negative egress test in the security test environment."""
         ...
 
 

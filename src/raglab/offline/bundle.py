@@ -26,6 +26,7 @@ _CATALOG_FAILURE = "RAGLAB-BUNDLE-003"
 _APPROVAL_FAILURE = "RAGLAB-BUNDLE-004"
 _LICENSE_FAILURE = "RAGLAB-BUNDLE-005"
 _CONTROLS = frozenset({"manifest.json", "approval.json", "bundle.cat"})
+VerifiedPayloadObserver = Callable[[Mapping[str, PinnedPath], str, VerificationDeadline], None]
 _APPROVAL_TIME = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{1,6})?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])"
@@ -287,6 +288,7 @@ def _verify_snapshot(
     limits: VerificationLimits,
     deadline: VerificationDeadline,
     require_unchanged: Callable[[], None],
+    observe_verified_payload: VerifiedPayloadObserver | None,
 ) -> BundleReport:
     inventory = _inventory(root.path, paths, locks, limits, deadline)
     files = {
@@ -371,6 +373,9 @@ def _verify_snapshot(
         json.dumps(digests, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("ascii")
     ).hexdigest()
     require_unchanged()
+    if observe_verified_payload is not None:
+        deadline.call(observe_verified_payload, {name: files[name] for name in payload}, generation, deadline)
+        require_unchanged()
     if approval.expires_at <= datetime.now(timezone.utc):
         expired = BundleFailure(_APPROVAL_FAILURE, "approval.json", "approval expired")
         return BundleReport("BLOCK", approval.identifier, (expired,))
@@ -384,6 +389,7 @@ def verify_bundle(
     publisher_authority: PublisherAuthority | None = None,
     limits: VerificationLimits = VerificationLimits(),
     local_paths: WindowsLocalPaths | None = None,
+    observe_verified_payload: VerifiedPayloadObserver | None = None,
 ) -> BundleReport:
     from raglab.offline.windows import MachinePublisherAuthority
 
@@ -399,7 +405,10 @@ def verify_bundle(
             except (OSError, RuntimeError, ValueError):
                 return _block(_PATH_FAILURE, ".", "missing or invalid local bundle directory")
             require_unchanged = locks.enter_context(paths.watch_namespace(pinned))
-            return _verify_snapshot(pinned, verifier, authority, paths, locks, limits, deadline, require_unchanged)
+            return _verify_snapshot(
+                pinned, verifier, authority, paths, locks, limits, deadline,
+                require_unchanged, observe_verified_payload,
+            )
     except _BundleBlocked as blocked:
         return BundleReport("BLOCK", None, (blocked.failure,))
     except (OSError, RuntimeError, ValueError):

@@ -1,0 +1,5 @@
+# Configuration
+
+The toolkit layers shipped security defaults, the named resource profile, and the optional JSON run overrides supported by config commands. Use local16 on the L16 workstation with a 12 GiB process working-set ceiling and one interactive query. Use local32 on the L32 workstation with a 26 GiB ceiling and two interactive queries. Overrides stay within the profile limits. Network mode remains deny and diagnostics stay content-free across layers.
+
+Local path fields are temp_root, cache_root, and output_root. Shipped defaults are tmp, cache, and runs, relative to the working data directory. Use owned direct local paths without reparses, remote drives, mapped drives, or device paths. To inspect the schema or effective values, run config validate --profile local16 or config explain --profile local16 --output .\runs\effective-config.json from the venv. Supply --run PATH to either command for a compatible optional run file. The effective configuration report records layer provenance and redacts paths. Use config diff --left PATH --right PATH to compare exported explanations.

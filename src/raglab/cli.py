@@ -25,6 +25,7 @@ from raglab.offline.ports import (
     ActiveEgressCanary, CatalogVerifier, EgressPolicyProbe, PublisherAuthority, SystemProbe,
 )
 from raglab.offline.progress import Redactor
+from raglab.offline.repro import verify_repro_bundle
 from raglab.offline.windows import (
     MachineDllReadinessProbe, WindowsCatalogVerifier, WindowsEgressPolicyProbe, WindowsSystemProbe,
 )
@@ -70,6 +71,13 @@ def build_parser() -> argparse.ArgumentParser:
     diff_config = config_commands.add_parser("diff")
     diff_config.add_argument("--left", type=Path, required=True)
     diff_config.add_argument("--right", type=Path, required=True)
+    reproduce = subparsers.add_parser("reproduce")
+    mode = reproduce.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--verify-only", action="store_true")
+    mode.add_argument("--diff-env", action="store_true")
+    reproduce.add_argument("--bundle", type=Path)
+    reproduce.add_argument("--left", type=Path)
+    reproduce.add_argument("--right", type=Path)
     return parser
 
 
@@ -268,6 +276,26 @@ def _demo_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _reproduce_command(args: argparse.Namespace) -> int:
+    if args.verify_only:
+        report = verify_repro_bundle(args.bundle)
+        print(f"Repro bundle verification {report.status}")
+        return report.exit_code
+
+    left = verify_repro_bundle(args.left)
+    right = verify_repro_bundle(args.right)
+    if left.environment is None or right.environment is None:
+        print("Repro bundle verification BLOCK")
+        return 7
+    changes = {
+        key: {"left": left.environment[key], "right": right.environment[key]}
+        for key in left.environment
+        if left.environment[key] != right.environment[key]
+    }
+    print(serialize_json(changes), end="")
+    return 0
+
+
 def _traceback_locations(exc: Exception) -> list[dict[str, object]]:
     # Capture the call stack without asking traceback to load or format source.
     package = Path(__file__).parent
@@ -352,6 +380,14 @@ def main(
         parser = build_parser()
         try:
             args = parser.parse_args(argv)
+            if args.command == "reproduce":
+                valid = (
+                    args.bundle is not None and args.left is None and args.right is None
+                    if args.verify_only else
+                    args.bundle is None and args.left is not None and args.right is not None
+                )
+                if not valid:
+                    parser.error("invalid reproduce mode operands")
         except SystemExit as exc:
             return int(exc.code)
         if args.command == "verify-bundle":
@@ -360,6 +396,8 @@ def main(
         if args.command == "doctor":
             verifier = catalog_verifier if catalog_verifier is not None else WindowsCatalogVerifier()
             return _doctor_command(args, verifier, publisher_authority, system_probe, egress_probe, active_canary)
+        if args.command == "reproduce":
+            return _reproduce_command(args)
         if args.command == "config":
             return _config_command(args)
         if args.command == "demo":

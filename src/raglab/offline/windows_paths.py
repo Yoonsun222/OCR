@@ -16,6 +16,7 @@ _SYSTEM32_ONLY = 0x00000800
 _INVALID_HANDLE = ctypes.c_void_p(-1).value
 _FILE_SHARE_READ = 0x00000001
 _FILE_SHARE_WRITE = 0x00000002
+_FILE_SHARE_DELETE = 0x00000004
 _GENERIC_READ = 0x80000000
 _GENERIC_WRITE = 0x40000000
 _DELETE = 0x00010000
@@ -323,7 +324,7 @@ class WindowsLocalPaths:
 
 
     @contextmanager
-    def watch_namespace(self, directory: PinnedPath):
+    def watch_namespace(self, directory: PinnedPath, *, owned_for_rename: bool = False):
         # One outstanding recursive Windows notification stays armed from intake
         # through the final decision. Any completion, including overflow, blocks.
         create_file = bind(
@@ -353,7 +354,8 @@ class WindowsLocalPaths:
         handle = None
         try:
             handle = create_file(
-                "\\\\?\\" + str(directory.path), _FILE_LIST_DIRECTORY, _FILE_SHARE_READ, None,
+                "\\\\?\\" + str(directory.path), _FILE_LIST_DIRECTORY,
+                _FILE_SHARE_READ | (_FILE_SHARE_DELETE if owned_for_rename else 0), None,
                 _OPEN_EXISTING, _OPEN_REPARSE_POINT | _BACKUP_SEMANTICS | _OVERLAPPED_IO, None,
             )
             if handle == _INVALID_HANDLE:
@@ -474,6 +476,104 @@ class WindowsLocalPaths:
             finally:
                 if not close(handle):
                     raise ctypes.WinError(ctypes.get_last_error())
+
+    def _open_for_removal(self, path: Path, *, directory: bool = False) -> int:
+        create_file = bind(
+            self._kernel, "CreateFileW", win.HANDLE,
+            win.LPCWSTR, win.DWORD, win.DWORD, ctypes.c_void_p,
+            win.DWORD, win.DWORD, win.HANDLE,
+        )
+        handle = create_file(
+            "\\\\?\\" + str(path), _GENERIC_READ | _DELETE, _FILE_SHARE_READ, None,
+            _OPEN_EXISTING, _OPEN_REPARSE_POINT | (_BACKUP_SEMANTICS if directory else 0), None,
+        )
+        if handle == _INVALID_HANDLE:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return handle
+
+    def _remove_owned_members(self, directory: Path, members: Mapping[str, tuple[int, bytes]]) -> None:
+        close = bind(self._kernel, "CloseHandle", win.BOOL, win.HANDLE)
+        for member, file_id in members.items():
+            try:
+                handle = self._open_for_removal(directory / member)
+            except FileNotFoundError:
+                continue
+            try:
+                info = self.identity(handle)
+                if not info.is_directory and info.file_id == file_id:
+                    self._discard_owned_file(handle)
+            finally:
+                close(handle)
+
+    def publish_new_directory(self, parent: PinnedPath, name: str, files: Mapping[str, bytes]) -> None:
+        """Stage owned files, then publish the owned directory without replacement."""
+        if not parent.info.is_directory or not path_segment_is_safe(name) or any(
+            not path_segment_is_safe(member) for member in files
+        ):
+            raise ValueError("invalid directory publication")
+        destination = parent.path / name
+        try:
+            with self.pin_entry(destination):
+                raise FileExistsError("destination already exists")
+        except FileNotFoundError:
+            pass
+
+        close = bind(self._kernel, "CloseHandle", win.BOOL, win.HANDLE)
+        staging = parent.path / f".raglab-{uuid.uuid4().hex}.tmp"
+        staging.mkdir()
+        handle = self._open_for_removal(staging, directory=True)
+        owned = {}
+        owned_directory = False
+        published = False
+        with ExitStack() as checked:
+            try:
+                info = self.identity(handle)
+                if not info.is_directory or str(self._canonical(handle)) != str(staging):
+                    raise ValueError("unexpected staging directory")
+                owned_directory = True
+                directory = PinnedPath(staging, info, handle)
+                with ExitStack() as entries, ExitStack() as rollback:
+                    for member, content in files.items():
+                        file = self._create_owned_file(staging / member)
+                        entries.callback(close, file)
+                        rollback.callback(self._discard_owned_file, file)
+                        owned[member] = self.identity(file).file_id
+                        self._write_owned_file(file, content)
+                    with self.watch_namespace(directory, owned_for_rename=True) as unchanged:
+                        with os.scandir(staging) as contents:
+                            names = {entry.name for _, entry in zip(range(len(files) + 1), contents)}
+                            if names != files.keys():
+                                raise ValueError("unexpected staged inventory")
+                        unchanged()
+                        # Windows requires closed child handles for directory rename.
+                        # Keep the directory and watcher held, then pin and verify
+                        # each child again before releasing the owned directory.
+                        rollback.pop_all()
+                        entries.close()
+                        self._rename_file(handle, destination, replace=False)
+                        for member, content in files.items():
+                            entry = checked.enter_context(self.pin_entry(destination / member))
+                            if (
+                                entry.info.file_id != owned[member] or entry.info.link_count != 1
+                                or entry.path.name != member or entry.read_bytes(len(content)) != content
+                            ):
+                                raise ValueError("staged file changed")
+                        unchanged()
+                        published = True
+            finally:
+                try:
+                    if owned_directory and not published:
+                        checked.close()
+                        current = self._canonical(handle)
+                        if current == destination:
+                            # Keep a failed directory outside the destination even
+                            # when a foreign entry prevents removing it.
+                            current = parent.path / f".raglab-{uuid.uuid4().hex}.tmp"
+                            self._rename_file(handle, current, replace=False)
+                        self._remove_owned_members(current, owned)
+                        self._discard_owned_file(handle)
+                finally:
+                    close(handle)
 
     def publish_new_files(
         self, parent: PinnedPath, files: Mapping[str, bytes], release_protection: Callable[[], None],

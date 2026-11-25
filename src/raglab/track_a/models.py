@@ -3,6 +3,7 @@
 import math
 import re
 from dataclasses import dataclass
+from itertools import islice
 from typing import Literal
 
 from raglab.contracts.evidence import BBox, EvidenceRegionV1, NativeLocator
@@ -10,6 +11,8 @@ from raglab.security.authorization import QueryPin
 
 Box = tuple[float, float, float, float]
 Point = tuple[float, float]
+_IntegerPoint = tuple[int, int]
+_MAX_VERTICES = 256
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
@@ -52,6 +55,46 @@ class OcrToken:
         object.__setattr__(self, "box", box)
 
 
+def _orientation(a: _IntegerPoint, b: _IntegerPoint, c: _IntegerPoint) -> int:
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _segments_meet(a: _IntegerPoint, b: _IntegerPoint, c: _IntegerPoint, d: _IntegerPoint) -> bool:
+    for start_a, end_a, start_b, end_b in zip(a, b, c, d):
+        if max(start_a, end_a) < min(start_b, end_b) or max(start_b, end_b) < min(start_a, end_a):
+            return False
+    return (
+        _orientation(a, b, c) * _orientation(a, b, d) <= 0
+        and _orientation(c, d, a) * _orientation(c, d, b) <= 0
+    )
+
+
+def _require_simple_polygon(polygon: tuple[Point, ...], error: str) -> None:
+    if len(set(polygon)) != len(polygon):
+        raise ValueError(error)
+
+    # Binary float denominators are powers of two. A common scale gives exact
+    # orientation and area comparisons without a tolerance tied to canvas size.
+    ratios = [tuple(value.as_integer_ratio() for value in point) for point in polygon]
+    scale = max(denominator for point in ratios for _, denominator in point)
+    vertices = tuple(tuple(n * (scale // d) for n, d in point) for point in ratios)
+    edges = tuple(zip(vertices, vertices[1:] + vertices[:1]))
+    if not sum(a[0] * b[1] - a[1] * b[0] for a, b in edges):
+        raise ValueError(error)
+
+    for index, (a, b) in enumerate(edges):
+        _, c = edges[(index + 1) % len(edges)]
+        if _orientation(a, b, c) == 0 and any(
+            (end - start) * (following - end) < 0
+            for start, end, following in zip(a, b, c)
+        ):
+            raise ValueError(error)
+        end = len(edges) - 1 if index == 0 else len(edges)
+        for c, d in edges[index + 2:end]:
+            if _segments_meet(a, b, c, d):
+                raise ValueError(error)
+
+
 @dataclass(frozen=True, slots=True)
 class TargetRegion:
     region_id: str
@@ -60,21 +103,23 @@ class TargetRegion:
 
     def __post_init__(self) -> None:
         _require_text(self.region_id, self.kind)
-        error = "target polygon must have positive area inside [0,1]"
+        error = "target requires a simple polygon with positive area inside [0,1]"
         try:
-            polygon = tuple(tuple(point) for point in self.polygon)
+            raw = tuple(islice(self.polygon, _MAX_VERTICES + 2))
+            if len(raw) > _MAX_VERTICES + 1:
+                raise ValueError("target polygon exceeds the vertex limit")
+            polygon = tuple(tuple(islice(point, 3)) for point in raw)
         except TypeError:
             raise ValueError(error) from None
-        if len(polygon) < 3 or any(
-            len(point) != 2 or not all(_unit(value) for value in point) for point in polygon
-        ):
+        if any(len(point) != 2 or not all(_unit(value) for value in point) for point in polygon):
             raise ValueError(error)
-        area = math.fsum(
-            x1 * y2 - x2 * y1
-            for (x1, y1), (x2, y2) in zip(polygon, polygon[1:] + polygon[:1])
-        )
-        if not area:
+        if len(polygon) > 1 and polygon[0] == polygon[-1]:
+            polygon = polygon[:-1]
+        if len(polygon) > _MAX_VERTICES:
+            raise ValueError("target polygon exceeds the vertex limit")
+        if len(polygon) < 3:
             raise ValueError(error)
+        _require_simple_polygon(polygon, error)
         object.__setattr__(self, "polygon", polygon)
 
 

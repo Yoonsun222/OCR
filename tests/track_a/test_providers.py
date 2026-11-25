@@ -62,3 +62,24 @@ def test_svg_rejects_symbolic_link(tmp_path) -> None:
         pytest.skip("symbolic links unavailable")
     with pytest.raises(ValueError, match="local SVG"):
         read_svg_regions(str(link))
+
+
+@pytest.mark.parametrize("page", ["invalid-synthetic-page", "0", "-1", "1.0", "2"])
+def test_tsv_rejects_malformed_or_mixed_page_numbers(page) -> None:
+    text = (FIXTURES / "mixed_labels.tsv").read_text(encoding="utf-8")
+    lines = text.splitlines()
+    lines[-1] = lines[-1].replace("4\t1\t", f"4\t{page}\t", 1)
+    # The non-word row still belongs to the same page as the accepted tokens.
+    with pytest.raises(ValueError, match="invalid recorded OCR TSV") as error:
+        parse_tsv("\n".join(lines), 1000, 500)
+    assert "invalid-synthetic-page" not in str(error.value)
+
+
+def test_tsv_accepts_a_single_recorded_page_with_arbitrary_positive_number() -> None:
+    text = (FIXTURES / "mixed_labels.tsv").read_text(encoding="utf-8")
+    lines = text.splitlines()
+    rows = [line.split("\t") for line in lines[1:]]
+    for row in rows:
+        row[1] = "4"
+    page = "\n".join([lines[0], *("\t".join(row) for row in rows)])
+    assert len(parse_tsv(page, 1000, 500)) == 3

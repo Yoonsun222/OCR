@@ -20,12 +20,20 @@ def parse_tsv(text: str, width: int, height: int) -> tuple[OcrToken, ...]:
         raise ValueError("recorded TSV exceeds the input limit")
     rows = csv.reader(io.StringIO(text, newline=""), delimiter="\t", quoting=csv.QUOTE_NONE)
     result: list[OcrToken] = []
+    page_number: int | None = None
     try:
         if tuple(next(rows, ())) != _HEADER:
             raise ValueError("invalid header")
         for row in rows:
             if len(row) != len(_HEADER) or row[0] not in ("1", "2", "3", "4", "5"):
                 raise ValueError("invalid row")
+            page = row[1]
+            if not page.isascii() or not page.isdecimal():
+                raise ValueError("invalid page number")
+            current_page = int(page)
+            if current_page <= 0 or (page_number is not None and page_number != current_page):
+                raise ValueError("expected one positive page number")
+            page_number = current_page
             if row[0] != "5":
                 continue
             confidence = float(row[10])

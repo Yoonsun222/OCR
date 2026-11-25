@@ -8,6 +8,7 @@ import xml.etree.ElementTree as ET
 import pytest
 
 from raglab.offline import demo
+from raglab.offline import windows_paths
 
 
 REPORT = Path(__file__).parents[1] / "fixtures" / "doctor-pass.json"
@@ -101,3 +102,38 @@ def test_occupied_final_marker_rolls_back_owned_outputs(passing_doctor, tmp_path
     assert failure.value.exit_code == 2
     assert list(tmp_path.iterdir()) == [marker]
     assert marker.read_bytes() == b"an unrelated file"
+
+
+def test_readable_marker_always_has_readable_companions(passing_doctor, tmp_path, monkeypatch):
+    marker_handle = None
+    inspected = False
+    rename = windows_paths.WindowsLocalPaths._rename_file
+    bind = windows_paths.bind
+
+    def observe_rename(paths, handle, destination, *, replace=True):
+        nonlocal marker_handle
+        rename(paths, handle, destination, replace=replace)
+        if destination.name == "result.json":
+            marker_handle = handle
+
+    def observe_bind(library, name, *types):
+        function = bind(library, name, *types)
+        if name != "CloseHandle":
+            return function
+
+        def observe_close(handle):
+            nonlocal inspected
+            closed = function(handle)
+            if handle == marker_handle:
+                inspected = True
+                for filename in demo.DEMO_OUTPUTS:
+                    assert (tmp_path / filename).read_bytes()
+            return closed
+
+        return observe_close
+
+    monkeypatch.setattr(windows_paths, "bind", observe_bind)
+    monkeypatch.setattr(windows_paths.WindowsLocalPaths, "_rename_file", observe_rename)
+    report, clock = passing_doctor
+    demo.run_synthetic_demo(demo.DemoContext(report, tmp_path, clock=clock))
+    assert inspected

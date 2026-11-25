@@ -478,24 +478,26 @@ class WindowsLocalPaths:
     def publish_new_files(
         self, parent: PinnedPath, files: Mapping[str, bytes], release_protection: Callable[[], None],
     ) -> None:
-        """Stage exclusive writes and publish in order without replacing any file."""
+        """Publish new files in order, making the last file readable last."""
         close = bind(self._kernel, "CloseHandle", win.BOOL, win.HANDLE)
         with ExitStack() as handles, ExitStack() as rollback:
             staged = {}
-            for name, content in files.items():
+            # ExitStack closes in reverse order. Register the final publication's
+            # handle first so it stays exclusive until all prior files are readable.
+            for name in reversed(tuple(files)):
                 if not path_segment_is_safe(name):
                     raise ValueError("invalid output file name")
                 handle = self._create_owned_file(parent.path / f".raglab-{uuid.uuid4().hex}.tmp")
                 handles.callback(close, handle)
                 rollback.callback(self._discard_owned_file, handle)
-                self._write_owned_file(handle, content)
+                self._write_owned_file(handle, files[name])
                 staged[name] = handle
             with self.pin(parent.path, directory_write_sharing=True) as publishing:
                 if publishing.info.file_id != parent.info.file_id:
                     raise ValueError("output directory changed")
                 release_protection()
-                for name, handle in staged.items():
-                    self._rename_file(handle, publishing.path / name, replace=False)
+                for name in files:
+                    self._rename_file(staged[name], publishing.path / name, replace=False)
                 rollback.pop_all()
 
     def publish_report(

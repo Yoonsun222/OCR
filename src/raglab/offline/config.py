@@ -12,7 +12,21 @@ from raglab.offline.windows_paths import WindowsLocalPaths, path_segment_is_safe
 
 
 CONFIG_DIRECTORY = Path(__file__).parents[3] / "configs"
-PROFILES = ("local16", "local32")
+_PROFILE_CEILINGS = {
+    "local16": (
+        ("interactive_concurrency", 1),
+        ("max_working_set_gib", 12),
+        ("rerank_candidates", 20),
+        ("visual_candidates", 3),
+    ),
+    "local32": (
+        ("interactive_concurrency", 2),
+        ("max_working_set_gib", 26),
+        ("rerank_candidates", 30),
+        ("visual_candidates", 5),
+    ),
+}
+PROFILES = tuple(_PROFILE_CEILINGS)
 LOCKED_SECURITY_FIELDS = frozenset({"network_mode", "diagnostic_content"})
 FIELD_RULES = MappingProxyType({
     "network_mode": (str, frozenset({"deny"})),
@@ -116,12 +130,13 @@ def _field_issues(value: Mapping[str, object]) -> tuple[ConfigIssue, ...]:
 
 
 def _profile_issues(values: Mapping[str, object]) -> tuple[ConfigIssue, ...]:
-    if values.get("profile") != "local16":
+    profile = values.get("profile")
+    if type(profile) is not str:
         return ()
     issues = []
-    for key, ceiling in (("interactive_concurrency", 1), ("max_working_set_gib", 12)):
+    for key, ceiling in _PROFILE_CEILINGS.get(profile, ()):
         value = values.get(key)
-        if type(value) is int and ceiling < value <= max(FIELD_RULES[key][1]):
+        if type(value) is int and value > ceiling and value in FIELD_RULES[key][1]:
             issues.append(ConfigIssue(_VALUE_ISSUE, key, "value exceeds the selected profile ceiling"))
     return tuple(issues)
 

@@ -160,3 +160,19 @@ def test_diff_rejects_untrusted_report_schema_without_echo(tmp_path, capsys, cor
     output = capsys.readouterr()
     assert output.out == ""
     assert "private-report" not in output.err
+
+
+@pytest.mark.parametrize("field,excess", [
+    ("max_working_set_gib", 13), ("interactive_concurrency", 2),
+    ("rerank_candidates", 21), ("visual_candidates", 4),
+])
+def test_diff_rejects_report_exceeding_selected_profile_ceiling(tmp_path, capsys, field, excess):
+    baseline = tmp_path / "baseline.json"
+    over_budget = tmp_path / "over-budget.json"
+    assert explain(baseline) == 0
+    document = json.loads(baseline.read_text(encoding="utf-8"))
+    document["values"][field]["value"] = excess
+    over_budget.write_text(json.dumps(document), encoding="utf-8")
+    capsys.readouterr()
+    assert diff(baseline, over_budget) == 2
+    assert capsys.readouterr().out == ""

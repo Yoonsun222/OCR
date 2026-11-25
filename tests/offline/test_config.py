@@ -131,12 +131,35 @@ def test_safe_config_paths_are_validated_without_io(path):
     assert validate_config({"output_root": path}) == ()
 
 
-def test_local16_run_cannot_exceed_memory_or_concurrency_envelope(tmp_path):
+@pytest.mark.parametrize("profile,limits", [
+    ("local16", {
+        "max_working_set_gib": 12, "interactive_concurrency": 1,
+        "rerank_candidates": 20, "visual_candidates": 3,
+    }),
+    ("local32", {
+        "max_working_set_gib": 26, "interactive_concurrency": 2,
+        "rerank_candidates": 30, "visual_candidates": 5,
+    }),
+])
+def test_validate_profile_enforces_every_resource_ceiling(profile, limits):
+    assert validate_config({"profile": profile, **limits}) == ()
+    excessive = {key: value + 1 for key, value in limits.items()}
+    issues = validate_config({"profile": profile, **excessive})
+    assert {issue.field for issue in issues} == limits.keys()
+    assert len(issues) == len(limits)
+
+
+def test_local16_run_cannot_exceed_any_resource_ceiling(tmp_path):
     run = tmp_path / "experiment.json"
-    run.write_text('{"max_working_set_gib":26,"interactive_concurrency":2}', encoding="utf-8")
+    run.write_text(
+        '{"max_working_set_gib":13,"interactive_concurrency":2,"rerank_candidates":21,"visual_candidates":4}',
+        encoding="utf-8",
+    )
     result = load_profile_config("local16", run)
     assert result.status == "BLOCK"
-    assert {issue.field for issue in result.issues} == {"max_working_set_gib", "interactive_concurrency"}
+    assert {issue.field for issue in result.issues} == {
+        "max_working_set_gib", "interactive_concurrency", "rerank_candidates", "visual_candidates",
+    }
 
 
 def test_run_cannot_switch_selected_profile(tmp_path):

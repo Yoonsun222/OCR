@@ -2,11 +2,12 @@ import argparse
 import json
 import os
 import sys
-from collections.abc import Sequence
-from contextlib import ExitStack
+from collections.abc import Iterator, Sequence
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import NoReturn
+from uuid import uuid4
 
 from raglab.offline import config as offline_config
 from raglab.offline.bundle import verify_bundle
@@ -17,10 +18,12 @@ from raglab.offline.doctor import (
     inspect_verified_bundle,
     run_doctor,
 )
+from raglab.offline.errors import OperatorError
 from raglab.offline.jsonio import serialize_json, write_json_atomic
 from raglab.offline.ports import (
     ActiveEgressCanary, CatalogVerifier, EgressPolicyProbe, PublisherAuthority, SystemProbe,
 )
+from raglab.offline.progress import Redactor
 from raglab.offline.windows import (
     MachineDllReadinessProbe, WindowsCatalogVerifier, WindowsEgressPolicyProbe, WindowsSystemProbe,
 )
@@ -92,6 +95,21 @@ def _publish_report(paths: WindowsLocalPaths, source: PinnedPath, output: Path, 
         paths.publish_report(parent, destination, serialize_json(value).encode("utf-8"), protected.close)
 
 
+@contextmanager
+def _local_input(stage: str, summary: str) -> Iterator[None]:
+    try:
+        yield
+    except (OSError, ValueError):
+        raise OperatorError(
+            code="RAGLAB-INPUT-001", stage=stage, summary=summary,
+            observed="local input or destination could not be accepted",
+            expected="valid local input and separate writable report destination",
+            protected_state="command stopped", retry_safe=True,
+            next_command=rf".\raglab.ps1 {stage} --help",
+            docs="docs/operator/ERROR-CATALOG.md#raglab-input-001",
+        ) from None
+
+
 def _verify_command(
     bundle: Path,
     output: Path,
@@ -99,21 +117,20 @@ def _verify_command(
     authority: PublisherAuthority | None,
 ) -> int:
     paths = WindowsLocalPaths()
-    try:
-        bundle = paths.validate(bundle)
-        output = paths.validate(output)
-        with ExitStack() as pins:
+    with ExitStack() as pins:
+        with _local_input("verify-bundle", "Invalid local bundle or report destination."):
+            bundle = paths.validate(bundle)
+            output = paths.validate(output)
             source = pins.enter_context(paths.pin(bundle, missing_ok=True, directory_write_sharing=True))
             parent = pins.enter_context(
                 paths.pin(output.parent, missing_ok=True, directory_write_sharing=True)
             )
             destination = parent.path / output.name
             _check_report_destination(paths, source, destination)
-            report = verify_bundle(source.path, verifier, publisher_authority=authority, local_paths=paths)
+        report = verify_bundle(source.path, verifier, publisher_authority=authority, local_paths=paths)
+
+        with _local_input("verify-bundle", "Invalid local bundle or report destination."):
             _publish_report(paths, source, destination, asdict(report))
-    except (OSError, RuntimeError, ValueError):
-        print("Invalid local bundle or report destination.", file=sys.stderr)
-        return 2
 
     print(f"Bundle verification {report.status}")
     return report.exit_code
@@ -133,11 +150,11 @@ def _doctor_command(
     def observe(files, fingerprint, expires_at, deadline):
         observations.append(inspect_verified_bundle(files, fingerprint, expires_at, deadline))
 
-    try:
-        bundle = paths.validate(args.bundle)
-        output = paths.validate(args.report)
-        config_directory = paths.validate(offline_config.CONFIG_DIRECTORY)
-        with ExitStack() as pins:
+    with ExitStack() as pins:
+        with _local_input("doctor", "Invalid local doctor input or report destination."):
+            bundle = paths.validate(args.bundle)
+            output = paths.validate(args.report)
+            config_directory = paths.validate(offline_config.CONFIG_DIRECTORY)
             source = pins.enter_context(paths.pin(bundle, missing_ok=True, directory_write_sharing=True))
             parent = pins.enter_context(paths.pin(output.parent, missing_ok=True, directory_write_sharing=True))
             config_root = pins.enter_context(paths.pin(
@@ -146,26 +163,25 @@ def _doctor_command(
             destination = parent.path / output.name
             _check_report_destination(paths, source, destination)
             _check_report_destination(paths, config_root, destination)
-            bundle_report = verify_bundle(
-                source.path, verifier, publisher_authority=authority, local_paths=paths,
-                observe_verified_payload=observe,
-            )
-            config = offline_config.load_profile_config(args.profile)
-            context = DoctorContext(
-                system if system is not None else WindowsSystemProbe(
-                    config, paths, (source.path, config_root.path),
-                ),
-                egress if egress is not None else WindowsEgressPolicyProbe(),
-                bundle_report, config,
-                observations[0] if observations else None,
-                CanaryRequest(args.active_egress_canary, args.approval_id, canary),
-                MachineDllReadinessProbe(),
-            )
-            report = run_doctor(context)
+        bundle_report = verify_bundle(
+            source.path, verifier, publisher_authority=authority, local_paths=paths,
+            observe_verified_payload=observe,
+        )
+        config = offline_config.load_profile_config(args.profile)
+        context = DoctorContext(
+            system if system is not None else WindowsSystemProbe(
+                config, paths, (source.path, config_root.path),
+            ),
+            egress if egress is not None else WindowsEgressPolicyProbe(),
+            bundle_report, config,
+            observations[0] if observations else None,
+            CanaryRequest(args.active_egress_canary, args.approval_id, canary),
+            MachineDllReadinessProbe(),
+        )
+        report = run_doctor(context)
+
+        with _local_input("doctor", "Invalid local doctor input or report destination."):
             _publish_report(paths, source, destination, asdict(report))
-    except (OSError, RuntimeError, ValueError):
-        print("Invalid local doctor input or report destination.", file=sys.stderr)
-        return 2
 
     for check in report.checks:
         print(f"{check.status:5} {check.check_id:23} {check.message}")
@@ -178,57 +194,129 @@ def _doctor_command(
 def _write_config_explanation(
     profile: str, run: Path | None, output: Path,
 ) -> offline_config.EffectiveConfig:
+    stage = "config"
+    summary = "Invalid local configuration input or output."
     if os.name == "nt":
         paths = WindowsLocalPaths()
-        output = paths.validate(output)
         with ExitStack() as pins:
-            config_root = pins.enter_context(paths.pin(
-                paths.validate(offline_config.CONFIG_DIRECTORY), directory_write_sharing=True,
-            ))
-            _check_report_destination(paths, config_root, output)
-            if run is not None:
-                source = pins.enter_context(paths.pin(
-                    paths.validate(run), missing_ok=True, directory_write_sharing=True,
+            with _local_input(stage, summary):
+                output = paths.validate(output)
+                config_root = pins.enter_context(paths.pin(
+                    paths.validate(offline_config.CONFIG_DIRECTORY), directory_write_sharing=True,
                 ))
-                _check_report_destination(paths, source, output)
-                run = source.path
+                _check_report_destination(paths, config_root, output)
+                if run is not None:
+                    source = pins.enter_context(paths.pin(
+                        paths.validate(run), missing_ok=True, directory_write_sharing=True,
+                    ))
+                    _check_report_destination(paths, source, output)
+                    run = source.path
             config = offline_config.load_profile_config(profile, run)
-            _publish_report(paths, config_root, output, offline_config.explain_config(config))
+            explanation = offline_config.explain_config(config)
+            with _local_input(stage, summary):
+                _publish_report(paths, config_root, output, explanation)
             return config
 
-    if str(output).startswith(("//", "\\\\")):
-        raise ValueError("configuration output must be local")
-    destination = output.resolve()
-    if destination.is_relative_to(offline_config.CONFIG_DIRECTORY.resolve()):
-        raise ValueError("configuration output collides with shipped configuration")
-    if run is not None:
-        source = run.resolve()
-        if destination.is_relative_to(source) or (
-            source.exists() and destination.exists() and source.samefile(destination)
-        ):
-            raise ValueError("configuration output collides with run input")
+    with _local_input(stage, summary):
+        if str(output).startswith(("//", "\\\\")):
+            raise ValueError("configuration output must be local")
+        destination = output.resolve()
+        if destination.is_relative_to(offline_config.CONFIG_DIRECTORY.resolve()):
+            raise ValueError("configuration output collides with shipped configuration")
+        if run is not None:
+            source = run.resolve()
+            if destination.is_relative_to(source) or (
+                source.exists() and destination.exists() and source.samefile(destination)
+            ):
+                raise ValueError("configuration output collides with run input")
     config = offline_config.load_profile_config(profile, run)
-    write_json_atomic(destination, offline_config.explain_config(config))
+    explanation = offline_config.explain_config(config)
+    with _local_input(stage, summary):
+        write_json_atomic(destination, explanation)
     return config
 
 
 def _config_command(args: argparse.Namespace) -> int:
-    try:
-        if args.config_command == "diff":
+    if args.config_command == "diff":
+        with _local_input("config", "Invalid local configuration input or output."):
             changes = offline_config.diff_config_reports(args.left, args.right)
-            print(json.dumps(changes, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False))
-            return 2 if changes else 0
+        print(json.dumps(changes, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False))
+        return 2 if changes else 0
 
-        if args.config_command == "explain":
-            config = _write_config_explanation(args.profile, args.run, args.output)
-        else:
-            config = offline_config.load_profile_config(args.profile, args.run)
-    except (OSError, RuntimeError, ValueError):
-        print("Invalid local configuration input or output.", file=sys.stderr)
-        return 2
-
+    if args.config_command == "explain":
+        config = _write_config_explanation(args.profile, args.run, args.output)
+    else:
+        config = offline_config.load_profile_config(args.profile, args.run)
     print(serialize_json(offline_config.summarize_config(config)), end="")
     return config.exit_code
+
+
+def _traceback_locations(exc: Exception) -> list[dict[str, object]]:
+    # Capture the call stack without asking traceback to load or format source.
+    package = Path(__file__).parent
+    frames = []
+    trace = exc.__traceback__
+    while trace is not None:
+        filename = Path(trace.tb_frame.f_code.co_filename)
+        frame: dict[str, object] = {"line": trace.tb_lineno}
+        if filename.is_relative_to(package):
+            frame["module"] = ".".join(filename.relative_to(package).with_suffix("").parts)
+        frames.append(frame)
+        trace = trace.tb_next
+    return frames
+
+
+def _write_diagnostic(output: Path, value: dict, args: argparse.Namespace | None) -> None:
+    # All paths produced here are independent of CLI operands. Keep logs outside
+    # the shipped configuration and any command input, including the bundle.
+    sources = [offline_config.CONFIG_DIRECTORY]
+    for field in ("bundle", "run", "left", "right", "doctor_report"):
+        operand = getattr(args, field, None)
+        if operand is not None:
+            sources.append(operand)
+    if os.name == "nt":
+        paths = WindowsLocalPaths()
+        output = paths.validate(output)
+        with ExitStack() as pins:
+            for source in sources:
+                protected = pins.enter_context(paths.pin(
+                    paths.validate(source), missing_ok=True, directory_write_sharing=True,
+                ))
+                _check_report_destination(paths, protected, output)
+            _publish_report(paths, protected, output, value)
+    else:
+        destination = output.resolve()
+        if destination != output.absolute() or any(
+            destination.is_relative_to(source.resolve()) for source in sources
+        ):
+            raise ValueError("unsafe diagnostics destination")
+        write_json_atomic(destination, value)
+
+
+def _report_error(
+    error: OperatorError, args: argparse.Namespace | None, exc: Exception | None = None,
+) -> int:
+    redactor = Redactor()
+    value = asdict(error)
+    if exc is not None:
+        value["traceback"] = _traceback_locations(exc)
+    value = redactor.redact(value)
+    output = Path("logs") / "diagnostics" / f"{uuid4().hex}.json"
+    try:
+        _write_diagnostic(output, value, args)
+    except Exception:
+        # Failure to write diagnostics must preserve the original exit code.
+        location = "unavailable"
+    else:
+        location = str(output)
+    for line in (
+        f"{value['code']} {value['summary']}",
+        f"Impact {value['protected_state']}",
+        f"Next command {value['next_command']}",
+        f"Diagnostics {location}",
+    ):
+        print(line.replace("\r", " ").replace("\n", " "), file=sys.stderr)
+    return error.exit_code
 
 
 def main(
@@ -240,17 +328,30 @@ def main(
     egress_probe: EgressPolicyProbe | None = None,
     active_canary: ActiveEgressCanary | None = None,
 ) -> int:
-    parser = build_parser()
+    args = None
     try:
-        args = parser.parse_args(argv)
-    except SystemExit as exc:
-        return int(exc.code)
-    if args.command == "verify-bundle":
-        verifier = catalog_verifier if catalog_verifier is not None else WindowsCatalogVerifier()
-        return _verify_command(args.bundle, args.report, verifier, publisher_authority)
-    if args.command == "doctor":
-        verifier = catalog_verifier if catalog_verifier is not None else WindowsCatalogVerifier()
-        return _doctor_command(args, verifier, publisher_authority, system_probe, egress_probe, active_canary)
-    if args.command == "config":
-        return _config_command(args)
-    return 0
+        parser = build_parser()
+        try:
+            args = parser.parse_args(argv)
+        except SystemExit as exc:
+            return int(exc.code)
+        if args.command == "verify-bundle":
+            verifier = catalog_verifier if catalog_verifier is not None else WindowsCatalogVerifier()
+            return _verify_command(args.bundle, args.report, verifier, publisher_authority)
+        if args.command == "doctor":
+            verifier = catalog_verifier if catalog_verifier is not None else WindowsCatalogVerifier()
+            return _doctor_command(args, verifier, publisher_authority, system_probe, egress_probe, active_canary)
+        if args.command == "config":
+            return _config_command(args)
+        return 0
+    except OperatorError as error:
+        return _report_error(error, args)
+    except Exception as exc:
+        error = OperatorError(
+            code="RAGLAB-INTERNAL-001", stage=getattr(args, "command", "startup"),
+            summary="unexpected internal failure", observed="command interrupted",
+            expected="command completion", protected_state="command stopped",
+            retry_safe=False, next_command=r".\raglab.ps1 --help",
+            docs="docs/operator/ERROR-CATALOG.md#raglab-internal-001", exit_code=10,
+        )
+        return _report_error(error, args, exc)

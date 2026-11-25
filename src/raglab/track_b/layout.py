@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from itertools import accumulate
+from unicodedata import normalize
 from xml.etree.ElementTree import Element
 
 from .coordinates import (
@@ -14,7 +15,35 @@ from .opc import OpcPackage
 S = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
 REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 TABLE_REL = f"{REL_TYPE}/table"
+MAX_TABLE_COUNT = 4_294_967_295
 TABLE_REL_ID = f"{{{REL_TYPE}}}id"
+
+
+class TableOwnership:
+    def __init__(self) -> None:
+        self.targets: set[str] = set()
+        self.ids: set[int] = set()
+        self.names: set[str] = set()
+
+    def claim_target(self, target: str) -> None:
+        if target in self.targets:
+            raise InvalidPackage("duplicate table target")
+        self.targets.add(target)
+
+    def claim_identity(self, table_id: int, name: str, display_name: str) -> None:
+        names = {normalize("NFC", value.strip().casefold()) for value in (name, display_name)}
+        if table_id in self.ids or "" in names or not self.names.isdisjoint(names):
+            raise InvalidPackage("invalid or duplicate table identity")
+        self.ids.add(table_id)
+        self.names.update(names)
+
+
+def _singleton(root: Element, tag: str) -> Element | None:
+    nodes = root.iterfind(f"{S}{tag}")
+    first = next(nodes, None)
+    if next(nodes, None) is not None:
+        raise InvalidPackage(f"duplicate {tag} element")
+    return first
 
 
 def _is_hidden(node: Element) -> bool:
@@ -46,47 +75,65 @@ def _reference(node: Element) -> str:
     return reference
 
 
-def _table_row_count(table: Element, attribute: str, default: str, maximum: int) -> int:
-    raw = table.get(attribute, default)
+def _nonnegative_index(raw: str, maximum: int) -> int:
     normalized = raw.strip(XML_WHITESPACE).removeprefix("+")
     if normalized and all(character == "0" for character in normalized):
         return 0
-    return positive_index(raw, maximum, "invalid table row count")
+    return positive_index(raw, maximum, "invalid table count")
 
 
-def _tables(package: OpcPackage, part: str, root: Element) -> tuple[TableObservation, ...]:
+def _check_declared_count(node: Element, actual_count: int) -> None:
+    count = node.get("count")
+    if count is not None and _nonnegative_index(count, MAX_TABLE_COUNT) != actual_count:
+        raise InvalidPackage("table declaration count mismatch")
+
+
+def _tables(
+    package: OpcPackage, part: str, root: Element, ownership: TableOwnership,
+) -> tuple[TableObservation, ...]:
+    table_parts = _singleton(root, "tableParts")
     relationships = {rel.relationship_id: rel for rel in package.relationships(part)}
+    if table_parts is None:
+        return ()
+    entries = table_parts.findall(f"{S}tablePart")
+    _check_declared_count(table_parts, len(entries))
     tables: list[TableObservation] = []
-    targets: set[str] = set()
-    table_ids: set[int] = set()
-    for node in root.iterfind(f"{S}tableParts/{S}tablePart"):
+    for node in entries:
         rel = relationships.get(node.get(TABLE_REL_ID, ""))
-        if rel is None or rel.relationship_type != TABLE_REL or rel.target in targets:
-            raise InvalidPackage("invalid or duplicate table relationship")
-        targets.add(rel.target)
+        if rel is None or rel.relationship_type != TABLE_REL:
+            raise InvalidPackage("invalid table relationship")
+        ownership.claim_target(rel.target)
         table = package.read_xml(rel.target)
         if table.tag != f"{S}table":
             raise InvalidPackage("invalid table part")
         table_id = table.get("id", "")
-        numeric_id = positive_index(table_id, 4_294_967_295, "invalid table ID")
+        numeric_id = positive_index(table_id, MAX_TABLE_COUNT, "invalid table ID")
         display_name = table.get("displayName", "")
         name = table.get("name", display_name)
-        if numeric_id in table_ids or not name.strip() or not display_name.strip():
-            raise InvalidPackage("invalid table metadata")
-        table_ids.add(numeric_id)
+        ownership.claim_identity(numeric_id, name, display_name)
         reference = table.get("ref", "")
-        top, _, bottom, _ = range_coordinates(reference)
+        top, left, bottom, right = range_coordinates(reference)
+        columns = _singleton(table, "tableColumns")
+        if columns is not None:
+            actual_count = sum(1 for _ in columns.iterfind(f"{S}tableColumn"))
+            _check_declared_count(columns, actual_count)
+            if actual_count != right - left + 1:
+                raise InvalidPackage("table column count differs from range width")
         height = bottom - top + 1
-        header = _table_row_count(table, "headerRowCount", "1", height)
-        totals = _table_row_count(table, "totalsRowCount", "0", height)
+        header = _nonnegative_index(table.get("headerRowCount", "1"), height)
+        totals = _nonnegative_index(table.get("totalsRowCount", "0"), height)
         if header + totals > height:
             raise InvalidPackage("table rows exceed table range")
         tables.append(TableObservation(table_id, name, display_name, reference, header, totals))
     return tuple(tables)
 
 
-def parse_layout(package: OpcPackage, sheet: SheetObservation, root: Element) -> SheetObservation:
-    filter_node = root.find(f"{S}autoFilter")
+def parse_layout(
+    package: OpcPackage, sheet: SheetObservation, root: Element, ownership: TableOwnership | None = None,
+) -> SheetObservation:
+    if ownership is None:
+        ownership = TableOwnership()
+    filter_node = _singleton(root, "autoFilter")
     return replace(
         sheet,
         merged_ranges=tuple(_reference(node) for node in root.iterfind(f"{S}mergeCells/{S}mergeCell")),
@@ -95,5 +142,5 @@ def parse_layout(package: OpcPackage, sheet: SheetObservation, root: Element) ->
         ),
         hidden_columns=_hidden_columns(root),
         auto_filter_range=_reference(filter_node) if filter_node is not None else None,
-        tables=_tables(package, sheet.part_name, root),
+        tables=_tables(package, sheet.part_name, root, ownership),
     )

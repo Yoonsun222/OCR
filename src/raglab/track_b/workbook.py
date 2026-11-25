@@ -9,7 +9,7 @@ from .coordinates import (
     MAX_COLUMN, XML_WHITESPACE, cell_coordinates, column_name, numbered_rows, positive_index,
 )
 from .errors import InvalidPackage, PackageLimitExceeded
-from .layout import parse_layout
+from .layout import TableOwnership, parse_layout
 from .models import CellObservation, SheetObservation, WorkbookObservation
 from .opc import OpcPackage, Relationship
 
@@ -168,6 +168,7 @@ def parse_workbook(package: OpcPackage) -> WorkbookObservation:
     sheet_names: set[str] = set()
     used_relationships: set[str] = set()
     used_parts: set[str] = set()
+    table_ownership = TableOwnership()
     remaining_cells = package.limits.max_workbook_cells
     sheet_nodes = sheet_list.iterfind(f"{S}sheet") if sheet_list is not None else ()
     for node in sheet_nodes:
@@ -203,5 +204,5 @@ def parse_workbook(package: OpcPackage) -> WorkbookObservation:
             part_name=rel.target,
             cells=cells,
         )
-        sheets.append(parse_layout(package, sheet, sheet_root))
+        sheets.append(parse_layout(package, sheet, sheet_root, table_ownership))
     return WorkbookObservation(package.source_hash(), date_system, tuple(sheets))

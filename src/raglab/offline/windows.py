@@ -518,34 +518,62 @@ def _windows_proxy_is_direct() -> bool:
                 free(pointer)
 
 
+def _policy_utc_expiration(value: object) -> datetime | None:
+    if not isinstance(value, str) or len(value) != 20:
+        return None
+    try:
+        expiration = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return expiration if expiration.strftime("%Y-%m-%dT%H:%M:%SZ") == value else None
+
+
 def _isolation_attestation_valid(document: object, now: datetime) -> bool:
     if not isinstance(document, dict) or document.keys() != {"schema_version", "scope", "expires_at"}:
         return False
-    expiry = document["expires_at"]
-    if not (
+    expiration = _policy_utc_expiration(document["expires_at"])
+    return (
         type(document["schema_version"]) is int and document["schema_version"] == 1
         and document["scope"] == "full-workstation-egress-deny"
-        and isinstance(expiry, str) and expiry.endswith("Z")
-    ):
-        return False
-    try:
-        expiration = datetime.strptime(expiry, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-        return expiration > now
-    except ValueError:
-        return False
+        and expiration is not None and expiration > now
+    )
 
 
-def _machine_isolation_is_attested() -> bool:
+def _machine_policy_json(value_name: str) -> object:
     import winreg
 
     with winreg.OpenKey(
         winreg.HKEY_LOCAL_MACHINE, _POLICY_KEY, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
     ) as key:
-        raw, value_type = winreg.QueryValueEx(key, "IsolatedWorkstationAttestation")
+        raw, value_type = winreg.QueryValueEx(key, value_name)
     if value_type != winreg.REG_SZ or not isinstance(raw, str) or len(raw) > 4096:
-        return False
-    document = json.loads(raw, object_pairs_hook=_unique_probe_object, parse_constant=_invalid_probe_constant)
+        return None
+    return json.loads(raw, object_pairs_hook=_unique_probe_object, parse_constant=_invalid_probe_constant)
+
+
+def _machine_isolation_is_attested() -> bool:
+    document = _machine_policy_json("IsolatedWorkstationAttestation")
     return _isolation_attestation_valid(document, datetime.now(timezone.utc))
+
+
+class MachineDllReadinessProbe:
+    def attested_until(self, generation_fingerprint: str, python_architecture: str) -> datetime | None:
+        try:
+            policy = _machine_policy_json("DllLoaderReadinessAttestation")
+        except (ImportError, OSError, ValueError, RecursionError):
+            return None
+        if not isinstance(policy, dict) or policy.keys() != {
+            "schema_version", "generation_fingerprint", "python_architecture", "expires_at",
+        }:
+            return None
+        if not (
+            type(policy["schema_version"]) is int and policy["schema_version"] == 1
+            and policy["generation_fingerprint"] == generation_fingerprint
+            and policy["python_architecture"] == python_architecture
+        ):
+            return None
+        expiration = _policy_utc_expiration(policy["expires_at"])
+        return expiration if expiration is not None and expiration > datetime.now(timezone.utc) else None
 
 
 class WindowsEgressPolicyProbe:

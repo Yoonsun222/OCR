@@ -147,3 +147,28 @@ def test_bundle_expiring_during_canary_blocks_final_report(monkeypatch):
     assert called
     assert report.checks[0].status == "BLOCK"
     assert report.overall_status == "BLOCK"
+
+
+def test_dll_loader_attestation_expiring_during_probes_blocks_final_report(monkeypatch):
+    baseline = context()
+    expiry = baseline.evidence.expires_at - timedelta(minutes=1)
+    now = expiry - timedelta(seconds=1)
+
+    class LoaderReadiness:
+        def attested_until(self, generation_fingerprint, python_architecture):
+            assert generation_fingerprint == baseline.bundle.generation_fingerprint
+            return expiry
+
+    class Egress:
+        def inspect(self):
+            nonlocal now
+            now = expiry
+            return EgressPolicy("DENIED")
+
+    monkeypatch.setattr(doctor, "_utc_now", lambda: now)
+    signed = replace(baseline.evidence, dll_count=1)
+    report = doctor.run_doctor(replace(
+        baseline, evidence=signed, dll_readiness=LoaderReadiness(), egress=Egress(),
+    ))
+    assert report.overall_status == "BLOCK"
+    assert next(item for item in report.checks if item.check_id == "DLL_INVENTORY").status == "BLOCK"

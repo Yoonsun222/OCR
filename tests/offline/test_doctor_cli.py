@@ -104,8 +104,12 @@ def test_canary_receives_only_pinned_signed_metadata(bundle, tmp_path, valid):
     assert endpoint not in output.read_text(encoding="utf-8")
 
 
-@pytest.mark.parametrize("correct_machine", [True, False])
-def test_signed_dll_header_is_checked_without_loading(bundle, tmp_path, monkeypatch, correct_machine):
+@pytest.mark.parametrize("correct_machine,policy,expected", [
+    (True, "valid", 0), (True, "missing", 5), (True, "wrong-generation", 5),
+    (True, "wrong-architecture", 5), (True, "expired", 5), (True, "offset-expiry", 5),
+    (False, "valid", 5),
+])
+def test_signed_dll_header_and_machine_loader_policy(bundle, tmp_path, monkeypatch, correct_machine, policy, expected):
     monkeypatch.setattr("raglab.offline.doctor.sysconfig.get_platform", lambda: "win-amd64")
     # This mock contains just enough static structure for the header check.
     data = bytearray(512)
@@ -116,10 +120,27 @@ def test_signed_dll_header_is_checked_without_loading(bundle, tmp_path, monkeypa
     struct.pack_into("<HHIIIHHH", data, 68, machine, 1, 0, 0, 0, 240, 0x2002, 0x20B)
     add_artifact(bundle, "synthetic.dll", data)
 
+    from raglab.offline import windows
+
     output = tmp_path / "reports" / "doctor.json"
     assert invoke(bundle, output) == 5
+    fingerprint = json.loads(output.read_text(encoding="utf-8"))["generation_fingerprint"]
+    attestation = {
+        "schema_version": 1,
+        "generation_fingerprint": "f" * 64 if policy == "wrong-generation" else fingerprint,
+        "python_architecture": "win-arm64" if policy == "wrong-architecture" else "win-amd64",
+        "expires_at": "2000-01-01T00:00:00Z" if policy == "expired" else "2099-01-01T00:00:00Z",
+    }
+    if policy == "offset-expiry":
+        attestation["expires_at"] = "2099-01-01T00:00:00+00:00"
+
+    def read_attestation(value_name):
+        assert value_name == "DllLoaderReadinessAttestation"
+        return None if policy == "missing" else attestation
+
+    monkeypatch.setattr(windows, "_machine_policy_json", read_attestation)
+    assert invoke(bundle, output) == expected
     report = json.loads(output.read_text(encoding="utf-8"))
     dll = next(check for check in report["checks"] if check["check_id"] == "DLL_INVENTORY")
-    assert dll["status"] == "BLOCK"
-    assert ("loader readiness remains unverified" in dll["message"]) is correct_machine
+    assert dll["status"] == ("PASS" if expected == 0 else "BLOCK")
     assert "synthetic.dll" not in repr(report)

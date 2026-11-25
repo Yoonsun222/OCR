@@ -13,7 +13,9 @@ from raglab.contracts.evidence import BBox
 from raglab.offline.bundle import BundleReport
 from raglab.offline.config import EffectiveConfig
 from raglab.offline.models import CheckResult, CheckStatus
-from raglab.offline.ports import ActiveEgressCanary, EgressPolicyProbe, SystemProbe, VerificationDeadline
+from raglab.offline.ports import (
+    ActiveEgressCanary, DllReadinessProbe, EgressPolicyProbe, SystemProbe, VerificationDeadline,
+)
 from raglab.offline.windows_names import WindowsFilenameIndex
 from raglab.offline.windows_paths import PinnedPath
 
@@ -58,6 +60,7 @@ class DoctorContext:
     config: EffectiveConfig
     evidence: VerifiedBundleEvidence | None = None
     canary: CanaryRequest = CanaryRequest()
+    dll_readiness: DllReadinessProbe | None = None
 
 
 @dataclass(frozen=True)
@@ -174,6 +177,18 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _loader_deadline(probe: DllReadinessProbe | None, fingerprint: str) -> datetime | None:
+    if probe is None:
+        return None
+    try:
+        expiration = probe.attested_until(fingerprint, sysconfig.get_platform())
+        if isinstance(expiration, datetime) and expiration.utcoffset() is not None:
+            return expiration.astimezone(timezone.utc)
+    except Exception:
+        pass
+    return None
+
+
 def run_doctor(context: DoctorContext) -> DoctorReport:
     checks: list[CheckResult] = []
 
@@ -245,13 +260,21 @@ def run_doctor(context: DoctorContext) -> DoctorReport:
 
     dll_count_valid = bound and type(evidence.dll_count) is int and evidence.dll_count >= 0
     dll_headers_valid = dll_count_valid and evidence.dll_compatible is True
-    dll_ok = dll_headers_valid and evidence.dll_count == 0
-    dll_failure = (
+    loader_required = dll_headers_valid and evidence.dll_count > 0
+    loader_deadline = _loader_deadline(context.dll_readiness, fingerprint) if loader_required else None
+    dll_failure = CheckResult(
+        "DLL_INVENTORY", CheckStatus.BLOCK,
         "DLL headers match the Python architecture, and loader readiness remains unverified"
-        if dll_headers_valid else "verified DLL inventory or PE header compatibility could not be established"
+        if dll_headers_valid else "verified DLL inventory or PE header compatibility could not be established",
+        "Use the company acceptance procedure to verify approved DLL loader readiness.",
     )
-    record("DLL_INVENTORY", dll_ok, "verified bundle requires no DLL loader checks",
-           dll_failure, "Use the company acceptance procedure to verify approved DLL loader readiness.")
+    dll_index = len(checks)
+    if dll_headers_valid and not loader_required:
+        checks.append(CheckResult("DLL_INVENTORY", CheckStatus.PASS, "verified bundle requires no DLL loader checks"))
+    elif loader_deadline is not None and _utc_now() < loader_deadline:
+        checks.append(CheckResult("DLL_INVENTORY", CheckStatus.PASS, "DLL headers match and loader readiness is attested"))
+    else:
+        checks.append(dll_failure)
     try:
         egress_ok = context.egress.inspect().status == "DENIED" and config_ok
     except Exception:
@@ -278,11 +301,13 @@ def run_doctor(context: DoctorContext) -> DoctorReport:
     request = context.canary
     if request.requested or request.approval_id is not None:
         authorization = evidence.canary if bound else None
+        checked_at = _utc_now()
         authorized = (
             request.requested is True and request.adapter is not None and authorization is not None
             and _valid_approval_id(request.approval_id) and request.approval_id == authorization.approval_id
             and all(check.status == CheckStatus.PASS for check in checks)
-            and expires is not None and _utc_now() < expires
+            and expires is not None and checked_at < expires
+            and (not loader_required or (loader_deadline is not None and checked_at < loader_deadline))
         )
         canary_ok = False
         if authorized:
@@ -297,6 +322,8 @@ def run_doctor(context: DoctorContext) -> DoctorReport:
     finished = _utc_now()
     if expires is None or expires <= finished:
         checks[0] = expired_approval
+    if loader_required and (loader_deadline is None or loader_deadline <= finished):
+        checks[dll_index] = dll_failure
     overall = CheckStatus.BLOCK if any(check.status == CheckStatus.BLOCK for check in checks) else CheckStatus.PASS
     return DoctorReport(1, uuid4().hex, profile, overall, tuple(checks),
                         finished.isoformat(), fingerprint, expires.isoformat() if expires is not None else None)

@@ -1,6 +1,7 @@
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from time import monotonic
 from typing import TYPE_CHECKING, Literal, Protocol
 
@@ -78,6 +79,12 @@ class SystemProbe(Protocol):
 
 class EgressPolicyProbe(Protocol):
     def inspect(self) -> EgressPolicy: ...
+
+
+class DllReadinessProbe(Protocol):
+    def attested_until(self, generation_fingerprint: str, python_architecture: str) -> datetime | None:
+        """Return the administrator's loader-readiness deadline for this bundle and runtime."""
+        ...
 
 
 class ActiveEgressCanary(Protocol):

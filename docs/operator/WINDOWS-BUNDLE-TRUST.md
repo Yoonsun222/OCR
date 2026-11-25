@@ -20,6 +20,23 @@ The manifest uses schema version 1 and exactly one entry per payload. Each entry
 
 Use direct local volumes that provide stable Windows file IDs. Bundle and report paths are checked before traversal. The supported paths exclude UNC paths, device paths, substituted or mapped drives, and reparse points. The verifier denies writes and deletes to the held filesystem objects while checking hashes and catalog membership. A recursive Windows namespace notification stays armed through the final decision. Any name or attribute change, overflow, or unavailable notification blocks the verified generation. The final inventory and file identities must match and the approval must still be current. Filename matching uses Windows ordinal comparison. A differing signed filename spelling must open the same held file. The report is flushed and atomically renamed by its exclusive staging handle in a pinned local report parent outside the bundle.
 
+## DLL loader readiness for offline doctor
+
+The doctor checks PE headers and Python process architecture using the pinned, verified bundle snapshot. If a bundle contains DLLs, the doctor also requires a current site acceptance attestation for that exact verified generation and Python architecture. Bundles without DLLs skip the loader attestation check. The doctor reads headers and machine policy without loading or executing any bundle DLL.
+
+The company acceptance owner must validate the exact payload against the supported runtime on the managed workstation image. Confirm that its ordinary and delay-loaded dependencies resolve only to approved bundle files or approved operating system components. Validate the target Python ABI, architecture, required redistributables, and the runtime's DLL search policy. Record the evidence and its review deadline. Revoke the attestation when the workstation image, dependency inventory, runtime, or search policy changes, and revalidate before renewing it.
+
+After acceptance, a security administrator maintains a `REG_SZ` named `DllLoaderReadinessAttestation` in the 64-bit view of `HKLM\SOFTWARE\Policies\RagLab\OfflineToolkit`. Restrict write access to the administrator and trusted deployment service. The value is a JSON object with exactly these fields.
+
+| Field | Required value |
+|---|---|
+| `schema_version` | Integer `1` |
+| `generation_fingerprint` | The exact 64-character lowercase hexadecimal value from the approved bundle verification report |
+| `python_architecture` | The verified Python runtime's platform value, such as `win-amd64`, `win-arm64`, or `win32` |
+| `expires_at` | A strictly future UTC expiry in `YYYY-MM-DDTHH:MM:SSZ` form |
+
+Missing, malformed, mismatched, and expired evidence blocks the DLL inventory check. A matching policy is valid only in conjunction with a current bundle approval and compatible PE headers. The doctor checks the expiry before finalizing readiness and before invoking an approved active canary.
+
 ## Intake limits and handoff
 
 | Limit | Default |

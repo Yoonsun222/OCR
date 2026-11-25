@@ -21,7 +21,9 @@ from raglab.offline.jsonio import serialize_json, write_json_atomic
 from raglab.offline.ports import (
     ActiveEgressCanary, CatalogVerifier, EgressPolicyProbe, PublisherAuthority, SystemProbe,
 )
-from raglab.offline.windows import WindowsCatalogVerifier, WindowsEgressPolicyProbe, WindowsSystemProbe
+from raglab.offline.windows import (
+    MachineDllReadinessProbe, WindowsCatalogVerifier, WindowsEgressPolicyProbe, WindowsSystemProbe,
+)
 from raglab.offline.windows_names import windows_name_compare
 from raglab.offline.windows_paths import PinnedPath, WindowsLocalPaths
 
@@ -157,6 +159,7 @@ def _doctor_command(
                 bundle_report, config,
                 observations[0] if observations else None,
                 CanaryRequest(args.active_egress_canary, args.approval_id, canary),
+                MachineDllReadinessProbe(),
             )
             report = run_doctor(context)
             _publish_report(paths, source, destination, asdict(report))

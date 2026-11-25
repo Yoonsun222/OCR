@@ -3,6 +3,7 @@ from zipfile import ZipFile
 
 import pytest
 
+from raglab.offline.windows_paths import WindowsLocalPaths
 from raglab.track_b.errors import (
     ForbiddenPart,
     InvalidPackage,
@@ -100,6 +101,8 @@ def test_rejects_macro_enabled_content_type(tmp_path: Path) -> None:
         ("https://example.invalid/private", ""),
         ("../../private.xml", ""),
         ("/private.xml", ""),
+        ("//xl/workbook.xml", ""),
+        ("/xl/../xl/workbook.xml", ""),
         ("%2e%2e/private.xml", ""),
         ("missing-private.xml", ""),
         ("workbook.xml", 'TargetMode="unexpected"'),
@@ -181,14 +184,19 @@ def test_rejects_malformed_zip_without_disclosing_path(tmp_path: Path) -> None:
     assert "private" not in str(error.value)
 
 
-def test_rejects_replacement_archive_after_validation(tmp_path: Path) -> None:
+def test_holds_original_file_until_package_closes(tmp_path: Path) -> None:
     path = write_xlsx(tmp_path / "sample.xlsx")
-    package = OpcPackage.open(path)
     replacement = write_xlsx(tmp_path / "replacement.xlsx", {"xl/workbook.xml": b"<changed/>"})
-    replacement.replace(path)
+    with OpcPackage.open(path) as package:
+        with pytest.raises(PermissionError):
+            replacement.replace(path)
+        assert package.read_xml("xl/workbook.xml").tag.endswith("}workbook")
 
-    with pytest.raises(InvalidPackage, match="package changed"):
+    replacement.replace(path)
+    with pytest.raises(InvalidPackage, match="package is closed"):
         package.read_xml("xl/workbook.xml")
+    with pytest.raises(InvalidPackage, match="package is closed"):
+        package.relationships("xl/workbook.xml")
 
 
 def test_rejects_unsupported_zip_compression(tmp_path: Path) -> None:
@@ -230,3 +238,75 @@ def test_rejects_network_paths_before_opening(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(Path, "open", unexpected_open)
     with pytest.raises(InvalidPackage, match="local file"):
         OpcPackage.open(Path("//example.invalid/share/sample.xlsx"))
+
+
+@pytest.mark.parametrize("target", (r"\Device\Mup\share", r"\??\C:\private"))
+def test_rejects_redirected_drives_before_any_pin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str,
+) -> None:
+    path = write_xlsx(tmp_path / "sample.xlsx")
+    monkeypatch.setattr(WindowsLocalPaths, "volume_target", lambda self, drive: target)
+
+    def unexpected_pin(*args: object, **kwargs: object) -> None:
+        pytest.fail("invalid volume must be rejected before pinning")
+
+    monkeypatch.setattr(WindowsLocalPaths, "pin", unexpected_pin)
+    with pytest.raises(InvalidPackage, match="local file") as error:
+        OpcPackage.open(path)
+    assert "private" not in str(error.value)
+
+
+def test_does_not_open_descendant_of_rejected_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parent = tmp_path / "redirected"
+    parent.mkdir()
+    path = write_xlsx(parent / "sample.xlsx")
+    pin_entry = WindowsLocalPaths.pin_entry
+
+    def reject_redirected(self: WindowsLocalPaths, entry: Path, **options: bool):
+        if entry == parent:
+            raise ValueError("synthetic private reparse point")
+        if entry == path:
+            pytest.fail("descendant must not be opened")
+        return pin_entry(self, entry, **options)
+
+    monkeypatch.setattr(WindowsLocalPaths, "pin_entry", reject_redirected)
+    with pytest.raises(InvalidPackage, match="local file") as error:
+        OpcPackage.open(path)
+    assert "private" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("payload", "options", "message"),
+    (
+        (b"<a><b><c/></b></a>", {"max_xml_depth": 2}, "depth"),
+        (b"<a><b/><c/></a>", {"max_xml_elements": 2}, "element count"),
+        (b'<a private="1" second="2"/>', {"max_xml_attributes": 1}, "attribute count"),
+        (b'<a xmlns:b="one" xmlns:c="two"/>', {"max_xml_attributes": 1}, "attribute count"),
+        (b'<a private="' + b"x" * 60 + b'"/>', {"max_xml_attribute_chars": 60}, "attribute text"),
+        (b"<a>private<b/>private</a>", {"max_xml_text_chars": 10}, "text"),
+    ),
+)
+def test_rejects_xml_structure_over_limit(
+    tmp_path: Path, payload: bytes, options: dict[str, int], message: str,
+) -> None:
+    path = write_xlsx(tmp_path / "sample.xlsx", {"xl/workbook.xml": payload})
+    with OpcPackage.open(path, OpcLimits(**options)) as package:
+        with pytest.raises(PackageLimitExceeded, match=message) as error:
+            package.read_xml("xl/workbook.xml")
+    assert "private" not in str(error.value)
+
+
+def test_resolves_package_absolute_workbook_relationship(tmp_path: Path) -> None:
+    path = write_xlsx(
+        tmp_path / "sample.xlsx",
+        {
+            "xl/_rels/workbook.xml.rels": _relationships("/xl/worksheets/sheet1.xml"),
+            "xl/worksheets/sheet1.xml": b"<worksheet/>",
+        },
+    )
+    with OpcPackage.open(path) as package:
+        assert package.relationships("xl/workbook.xml") == (
+            Relationship("rId1", "urn:test", "xl/worksheets/sheet1.xml"),
+        )

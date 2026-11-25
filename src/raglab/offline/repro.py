@@ -18,9 +18,9 @@ from raglab.contracts.errors import ErrorCode
 from raglab.offline.bundle import BundleReport
 from raglab.offline.config import FIELD_RULES, EffectiveConfig, validate_config
 from raglab.offline.demo import DemoRegion, DemoResult
-from raglab.offline.doctor import DoctorReport
+from raglab.offline.doctor import ACTIVE_EGRESS_CHECK, DoctorReport, validate_pass_report
 from raglab.offline.jsonio import serialize_json
-from raglab.offline.models import CheckResult, CheckStatus
+from raglab.offline.models import CheckStatus
 from raglab.offline.progress import ProgressEvent, Redactor
 from raglab.offline.windows_paths import PinnedPath, WindowsLocalPaths
 
@@ -80,7 +80,6 @@ _CONFIG_FIELDS = frozenset({
 })
 _LOCALES = frozenset(value.replace("_", "-") for value in locale.windows_locale.values())
 _ERROR_CODES = frozenset(code.value for code in ErrorCode)
-_CHECKS = frozenset({"OFFLINE_EGRESS_POLICY", "ACTIVE_EGRESS_CANARY"})
 
 
 def _pattern(expression: str) -> Callable[[object], bool]:
@@ -228,7 +227,7 @@ def _export(inputs: ReproInputs) -> dict[str, bytes]:
     bundle, config, doctor, demo = inputs.bundle_report, inputs.config, inputs.doctor_report, inputs.demo_result
     _require_original_fields(bundle, BundleReport)
     _require_original_fields(config, EffectiveConfig)
-    _require_original_fields(doctor, DoctorReport)
+    _, _, checks = validate_pass_report(doctor)
     _require_original_fields(demo, DemoResult)
     if (
         bundle.status != "PASS" or bundle.failures != ()
@@ -238,25 +237,14 @@ def _export(inputs: ReproInputs) -> dict[str, bytes]:
         or type(config.locked) is not frozenset or not config.locked <= _CONFIG_SOURCE_FIELDS
         or validate_config(config.values)
         or type(demo.regions) is not tuple or len(demo.regions) > 32
-        or not _v1(doctor.schema_version) or not _v1(demo.schema_version)
-        or doctor.overall_status != "PASS" or doctor.generation_fingerprint != bundle.generation_fingerprint
+        or not _v1(demo.schema_version) or doctor.generation_fingerprint != bundle.generation_fingerprint
         or not _count(demo.elapsed_ms)
         or not _has_fields(inputs.environment, _SCHEMAS["environment.json"].keys() - {"schema_version"})
         or not isinstance(inputs.deletion_report, Mapping)
-        or type(doctor.checks) is not tuple or len(doctor.checks) > 32
     ):
         raise ValueError("inconsistent source reports")
     for region in demo.regions:
         _require_original_fields(region, DemoRegion)
-    checks = {}
-    for check in doctor.checks:
-        _require_original_fields(check, CheckResult)
-        if type(check.check_id) is not str:
-            raise ValueError("invalid check identifier")
-        if check.check_id in _CHECKS:
-            if check.check_id in checks or check.status != "PASS":
-                raise ValueError("invalid offline check")
-            checks[check.check_id] = str(check.status)
     dataset = inputs.dataset
     documents = {
         "approvals.snapshot.json": {"schema_version": 1, "approval_id": bundle.approval_id, "status": "PASS"},
@@ -272,8 +260,8 @@ def _export(inputs: ReproInputs) -> dict[str, bytes]:
         "environment.json": {**inputs.environment, "schema_version": 1},
         "metrics.json": _metrics(inputs.progress, demo),
         "network-check.json": {
-            "schema_version": 1, "status": checks.get("OFFLINE_EGRESS_POLICY"),
-            "active_canary": checks.get("ACTIVE_EGRESS_CANARY", "NOT_REQUESTED"),
+            "schema_version": 1, "status": "PASS",
+            "active_canary": "PASS" if ACTIVE_EGRESS_CHECK in checks else "NOT_REQUESTED",
         },
         "pipeline-manifest.json": {"schema_version": 1, "pipeline": "synthetic_demo"},
         "run-manifest.json": {

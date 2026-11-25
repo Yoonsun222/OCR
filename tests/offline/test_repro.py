@@ -221,3 +221,69 @@ def test_late_foreign_member_keeps_failed_bundle_out_of_destination(tmp_path, mo
     [foreign] = tmp_path.glob(".raglab-*.tmp/unowned.txt")
     assert foreign.read_bytes() == b"foreign"
     assert list(foreign.parent.iterdir()) == [foreign]
+
+
+def test_path_creation_gap_cannot_take_custody_of_foreign_directory(tmp_path, monkeypatch):
+    mkdir = Path.mkdir
+    substituted = []
+
+    def replace_unheld_stage(self, *args, **kwargs):
+        mkdir(self, *args, **kwargs)
+        if self.parent == tmp_path and self.name.startswith(".raglab-"):
+            self.rmdir()
+            mkdir(self)
+            substituted.append(self)
+
+    monkeypatch.setattr(Path, "mkdir", replace_unheld_stage)
+    destination = tmp_path / "bundle"
+    report = build_repro_bundle(repro_inputs(), destination)
+    if substituted:
+        [foreign] = substituted
+        assert report.status == "BLOCK"
+        assert foreign.is_dir()
+        assert list(foreign.iterdir()) == []
+        assert not destination.exists()
+    else:
+        assert report.status == "PASS"
+        assert verify_repro_bundle(destination).status == "PASS"
+
+
+@pytest.mark.parametrize("change", ["missing", "blocked", "duplicate"])
+def test_complete_passing_doctor_checks_required_for_repro(tmp_path, change):
+    inputs = repro_inputs()
+    first, *other = inputs.doctor_report.checks
+    if change == "missing":
+        checks = tuple(other)
+    elif change == "blocked":
+        checks = (replace(first, status="BLOCK"), *other)
+    else:
+        checks = (first, first, *other)
+    report = replace(inputs.doctor_report, checks=checks)
+    assert build_repro_bundle(replace(inputs, doctor_report=report), tmp_path / "bundle").status == "BLOCK"
+
+
+def test_historical_complete_doctor_report_can_be_exported(tmp_path):
+    inputs = repro_inputs()
+    report = replace(
+        inputs.doctor_report, generated_at="2025-01-01T00:00:00Z",
+        bundle_approval_expires_at="2025-01-02T00:00:00Z",
+    )
+    assert build_repro_bundle(replace(inputs, doctor_report=report), tmp_path / "bundle").status == "PASS"
+
+
+def test_native_staging_creation_refuses_existing_name(tmp_path, monkeypatch):
+    from uuid import UUID
+
+    from raglab.offline import windows_paths
+
+    identifier = UUID(int=1)
+    staging = tmp_path / f".raglab-{identifier.hex}.tmp"
+    staging.mkdir()
+    preserved = staging / "foreign.txt"
+    preserved.write_bytes(b"untouched")
+    monkeypatch.setattr(windows_paths.uuid, "uuid4", lambda: identifier)
+
+    destination = tmp_path / "bundle"
+    assert build_repro_bundle(repro_inputs(), destination).status == "BLOCK"
+    assert preserved.read_bytes() == b"untouched"
+    assert not destination.exists()

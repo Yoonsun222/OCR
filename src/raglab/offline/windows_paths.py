@@ -21,6 +21,12 @@ _GENERIC_READ = 0x80000000
 _GENERIC_WRITE = 0x40000000
 _DELETE = 0x00010000
 _CREATE_NEW = 1
+_NT_FILE_CREATE = 2
+_NT_FILE_DIRECTORY_FILE = 0x00000001
+_NT_FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020
+_OBJ_CASE_INSENSITIVE = 0x00000040
+_OBJ_DONT_REPARSE = 0x00001000
+_SYNCHRONIZE = 0x00100000
 _FILE_LIST_DIRECTORY = 1
 _OVERLAPPED_IO = 0x40000000
 _NAMESPACE_CHANGES = 0x00000007  # File names, directory names, and attributes
@@ -56,6 +62,26 @@ def path_segment_is_safe(part: str) -> bool:
         or PureWindowsPath(part).is_reserved()
         or any(char in '<>:"|?*/\\' or ord(char) < 32 or 0xD800 <= ord(char) <= 0xDFFF for char in part)
     )
+
+
+class _UnicodeString(ctypes.Structure):
+    _fields_ = [("length", win.USHORT), ("maximum_length", win.USHORT), ("buffer", win.LPWSTR)]
+
+
+class _ObjectAttributes(ctypes.Structure):
+    _fields_ = [
+        ("length", win.ULONG),
+        ("root_directory", win.HANDLE),
+        ("object_name", ctypes.POINTER(_UnicodeString)),
+        ("attributes", win.ULONG),
+        ("security_descriptor", ctypes.c_void_p),
+        ("security_quality_of_service", ctypes.c_void_p),
+    ]
+
+
+class _IoStatusBlock(ctypes.Structure):
+    # The first field is a native union of NTSTATUS and PVOID.
+    _fields_ = [("status_or_pointer", ctypes.c_void_p), ("information", ctypes.c_size_t)]
 
 
 class _Overlapped(ctypes.Structure):
@@ -477,7 +503,38 @@ class WindowsLocalPaths:
                 if not close(handle):
                     raise ctypes.WinError(ctypes.get_last_error())
 
-    def _open_for_removal(self, path: Path, *, directory: bool = False) -> int:
+    def _create_owned_directory(self, parent: PinnedPath, name: str) -> int:
+        """Create exactly one child and acquire its delete-capable handle atomically."""
+        if parent.handle is None or not path_segment_is_safe(name):
+            raise ValueError("invalid directory creation operand")
+        ntdll = system_dll("ntdll.dll")
+        create_file = bind(
+            ntdll, "NtCreateFile", win.LONG,
+            ctypes.POINTER(win.HANDLE), win.DWORD, ctypes.POINTER(_ObjectAttributes),
+            ctypes.POINTER(_IoStatusBlock), ctypes.c_void_p, win.ULONG, win.ULONG,
+            win.ULONG, win.ULONG, ctypes.c_void_p, win.ULONG,
+        )
+        status_to_error = bind(ntdll, "RtlNtStatusToDosError", win.ULONG, win.LONG)
+        buffer = ctypes.create_unicode_buffer(name)
+        length = ctypes.sizeof(buffer) - ctypes.sizeof(win.WCHAR)
+        relative_name = _UnicodeString(length, ctypes.sizeof(buffer), ctypes.cast(buffer, win.LPWSTR))
+        attributes = _ObjectAttributes(
+            ctypes.sizeof(_ObjectAttributes), parent.handle, ctypes.pointer(relative_name),
+            _OBJ_CASE_INSENSITIVE | _OBJ_DONT_REPARSE, None, None,
+        )
+        handle = win.HANDLE()
+        io_status = _IoStatusBlock()
+        status = create_file(
+            ctypes.byref(handle), _GENERIC_READ | _DELETE | _SYNCHRONIZE,
+            ctypes.byref(attributes), ctypes.byref(io_status), None, 0, _FILE_SHARE_READ,
+            _NT_FILE_CREATE, _NT_FILE_DIRECTORY_FILE | _NT_FILE_SYNCHRONOUS_IO_NONALERT,
+            None, 0,
+        )
+        if status < 0:
+            raise ctypes.WinError(status_to_error(status))
+        return handle.value
+
+    def _open_for_removal(self, path: Path) -> int:
         create_file = bind(
             self._kernel, "CreateFileW", win.HANDLE,
             win.LPCWSTR, win.DWORD, win.DWORD, ctypes.c_void_p,
@@ -485,7 +542,7 @@ class WindowsLocalPaths:
         )
         handle = create_file(
             "\\\\?\\" + str(path), _GENERIC_READ | _DELETE, _FILE_SHARE_READ, None,
-            _OPEN_EXISTING, _OPEN_REPARSE_POINT | (_BACKUP_SEMANTICS if directory else 0), None,
+            _OPEN_EXISTING, _OPEN_REPARSE_POINT, None,
         )
         if handle == _INVALID_HANDLE:
             raise ctypes.WinError(ctypes.get_last_error())
@@ -519,9 +576,9 @@ class WindowsLocalPaths:
             pass
 
         close = bind(self._kernel, "CloseHandle", win.BOOL, win.HANDLE)
-        staging = parent.path / f".raglab-{uuid.uuid4().hex}.tmp"
-        staging.mkdir()
-        handle = self._open_for_removal(staging, directory=True)
+        staging_name = f".raglab-{uuid.uuid4().hex}.tmp"
+        staging = parent.path / staging_name
+        handle = self._create_owned_directory(parent, staging_name)
         owned = {}
         owned_directory = False
         published = False

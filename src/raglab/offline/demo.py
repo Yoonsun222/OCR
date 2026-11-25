@@ -14,11 +14,11 @@ from uuid import uuid4
 import xml.etree.ElementTree as ET
 
 from raglab.contracts.evidence import BBox
-from raglab.offline.config import CONFIG_DIRECTORY, PROFILES, EffectiveConfig, load_profile_config
-from raglab.offline.doctor import DoctorReport
+from raglab.offline.config import CONFIG_DIRECTORY, EffectiveConfig, load_profile_config
+from raglab.offline.doctor import REQUIRED_READINESS_CHECKS, DoctorReport, validate_pass_report
 from raglab.offline.errors import OperatorError
 from raglab.offline.jsonio import serialize_json
-from raglab.offline.models import CheckResult, CheckStatus
+from raglab.offline.models import CheckResult
 from raglab.offline.progress import ProgressEvent, serialize_progress_event
 from raglab.offline.windows_names import windows_name_compare
 from raglab.offline.windows_paths import WindowsLocalPaths
@@ -32,16 +32,9 @@ FIXTURE_HASHES = (
 DEMO_OUTPUTS = (
     "result.json", "overlay.svg", "summary.html", "events.jsonl", "deletion-smoke-report.json",
 )
-_REQUIRED_CHECKS = frozenset({
-    "BUNDLE_APPROVAL", "OS_PYTHON", "RESOURCE_PROFILE", "FREE_DISK", "WRITABLE_PATHS",
-    "LONG_UNICODE_PATH", "CATALOG_SIGNER", "DLL_INVENTORY", "OFFLINE_EGRESS_POLICY",
-    "MODEL_INVENTORY", "COORDINATE_ROUND_TRIP", "ATOMIC_WRITE_CLEANUP", "DERIVATIVE_DELETION",
-})
-_OPTIONAL_CHECK = "ACTIVE_EGRESS_CANARY"
 _REPORT_MAX_BYTES = 32 * 1024
 _FIXTURE_MAX_BYTES = 16 * 1024
 _MAX_REPORT_AGE = timedelta(hours=24)
-_UTC_TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|\+00:00)")
 _SVG = "{http://www.w3.org/2000/svg}"
 _DIMENSIONS = (1000, 600)
 _EXPECTED_REGION = "part-a"
@@ -121,7 +114,7 @@ def read_doctor_report(path: Path) -> DoctorReport:
         if not isinstance(value, dict) or value.keys() != {field.name for field in fields(DoctorReport)}:
             raise ValueError("invalid report fields")
         checks = value["checks"]
-        if not isinstance(checks, list) or not len(_REQUIRED_CHECKS) <= len(checks) <= len(_REQUIRED_CHECKS) + 1:
+        if not isinstance(checks, list) or not len(REQUIRED_READINESS_CHECKS) <= len(checks) <= len(REQUIRED_READINESS_CHECKS) + 1:
             raise ValueError("invalid number of checks")
         check_fields = {field.name for field in fields(CheckResult)}
         if any(not isinstance(check, dict) or check.keys() != check_fields for check in checks):
@@ -132,47 +125,14 @@ def read_doctor_report(path: Path) -> DoctorReport:
         raise _doctor_error() from exc
 
 
-def _timestamp(value: object) -> datetime:
-    if not isinstance(value, str) or not _UTC_TIMESTAMP.fullmatch(value):
-        raise ValueError("invalid UTC report time")
-    return datetime.fromisoformat(value)
-
-
-def _is_hex(value: object, length: int) -> bool:
-    return isinstance(value, str) and re.fullmatch(rf"[0-9a-f]{{{length}}}", value) is not None
-
-
 def _check_doctor(report: DoctorReport, config: EffectiveConfig, now: datetime) -> None:
     # The report is unsigned. This gate is confined to the fixed synthetic assets.
-    if (
-        type(report) is not DoctorReport
-        or type(report.schema_version) is not int or report.schema_version != 1
-        or config.status != "PASS"
-        or config.values.get("profile") != report.profile or report.profile not in PROFILES
-        or report.overall_status != CheckStatus.PASS
-        or not _is_hex(report.run_id, 32)
-        or not _is_hex(report.generation_fingerprint, 64)
-        or type(report.checks) is not tuple
-        or not len(_REQUIRED_CHECKS) <= len(report.checks) <= len(_REQUIRED_CHECKS) + 1
-    ):
-        raise _doctor_error()
     try:
-        generated = _timestamp(report.generated_at)
-        expiry = _timestamp(report.bundle_approval_expires_at)
+        generated, expiry, _ = validate_pass_report(report)
+        if config.status != "PASS" or config.values.get("profile") != report.profile:
+            raise ValueError("report and configuration do not match")
         if not timedelta(0) <= now - generated <= _MAX_REPORT_AGE or not now < expiry:
             raise ValueError("report time outside freshness window")
-        seen = set()
-        for check in report.checks:
-            if (
-                type(check) is not CheckResult or not isinstance(check.check_id, str)
-                or check.check_id in seen or check.status != CheckStatus.PASS
-                or check.action is not None or not isinstance(check.message, str)
-                or not 0 < len(check.message) <= 512 or not check.message.isprintable()
-            ):
-                raise ValueError("invalid PASS check")
-            seen.add(check.check_id)
-        if seen not in (_REQUIRED_CHECKS, _REQUIRED_CHECKS | {_OPTIONAL_CHECK}):
-            raise ValueError("incomplete or unfamiliar readiness checks")
     except (TypeError, ValueError) as exc:
         raise _doctor_error() from exc
 

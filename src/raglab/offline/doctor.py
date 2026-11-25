@@ -11,7 +11,7 @@ from uuid import uuid4
 
 from raglab.contracts.evidence import BBox
 from raglab.offline.bundle import BundleReport
-from raglab.offline.config import EffectiveConfig
+from raglab.offline.config import PROFILES, EffectiveConfig
 from raglab.offline.models import CheckResult, CheckStatus
 from raglab.offline.ports import (
     ActiveEgressCanary, DllReadinessProbe, EgressPolicyProbe, SystemProbe, VerificationDeadline,
@@ -26,6 +26,14 @@ _APPROVAL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 _FINGERPRINT = re.compile(r"[0-9a-f]{64}")
 _MODELS = (".gguf", ".onnx", ".safetensors", ".tflite", ".pt", ".pth", ".bin")
 _PE_MACHINE = {"win-amd64": (0x8664, 0x20B), "win-arm64": (0xAA64, 0x20B), "win32": (0x14C, 0x10B)}
+
+REQUIRED_READINESS_CHECKS = frozenset({
+    "BUNDLE_APPROVAL", "OS_PYTHON", "RESOURCE_PROFILE", "FREE_DISK", "WRITABLE_PATHS",
+    "LONG_UNICODE_PATH", "CATALOG_SIGNER", "DLL_INVENTORY", "OFFLINE_EGRESS_POLICY",
+    "MODEL_INVENTORY", "COORDINATE_ROUND_TRIP", "ATOMIC_WRITE_CLEANUP", "DERIVATIVE_DELETION",
+})
+ACTIVE_EGRESS_CHECK = "ACTIVE_EGRESS_CANARY"
+_UTC_TIMESTAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|\+00:00)")
 
 
 @dataclass(frozen=True)
@@ -73,6 +81,45 @@ class DoctorReport:
     generated_at: str
     generation_fingerprint: str | None
     bundle_approval_expires_at: str | None
+
+
+def _report_timestamp(value: object) -> datetime:
+    if type(value) is not str or not _UTC_TIMESTAMP.fullmatch(value):
+        raise ValueError("invalid UTC report time")
+    return datetime.fromisoformat(value)
+
+
+def validate_pass_report(report: DoctorReport) -> tuple[datetime, datetime, frozenset[str]]:
+    """Validate complete v1 passing evidence shape without applying a freshness window."""
+    required = REQUIRED_READINESS_CHECKS
+    if (
+        type(report) is not DoctorReport or vars(report).keys() != DoctorReport.__dataclass_fields__.keys()
+        or type(report.schema_version) is not int or report.schema_version != 1
+        or type(report.profile) is not str or report.profile not in PROFILES
+        or report.overall_status != CheckStatus.PASS
+        or type(report.run_id) is not str or re.fullmatch(r"[0-9a-f]{32}", report.run_id) is None
+        or type(report.generation_fingerprint) is not str or not _FINGERPRINT.fullmatch(report.generation_fingerprint)
+        or type(report.checks) is not tuple or not len(required) <= len(report.checks) <= len(required) + 1
+    ):
+        raise ValueError("invalid PASS doctor report")
+    generated = _report_timestamp(report.generated_at)
+    expires = _report_timestamp(report.bundle_approval_expires_at)
+    if not generated < expires:
+        raise ValueError("approval was expired at report generation")
+
+    seen = set()
+    for check in report.checks:
+        if (
+            type(check) is not CheckResult or vars(check).keys() != CheckResult.__dataclass_fields__.keys()
+            or type(check.check_id) is not str or check.check_id in seen or check.status != CheckStatus.PASS
+            or check.action is not None or type(check.message) is not str
+            or not 0 < len(check.message) <= 512 or not check.message.isprintable()
+        ):
+            raise ValueError("invalid PASS readiness check")
+        seen.add(check.check_id)
+    if seen not in (required, required | {ACTIVE_EGRESS_CHECK}):
+        raise ValueError("incomplete or unfamiliar readiness checks")
+    return generated, expires, frozenset(seen)
 
 
 def _valid_approval_id(value: object) -> bool:
@@ -315,7 +362,7 @@ def run_doctor(context: DoctorContext) -> DoctorReport:
                 canary_ok = request.adapter.verify_denied(authorization.endpoint, request.approval_id) is True
             except Exception:
                 pass
-        record("ACTIVE_EGRESS_CANARY", canary_ok, "authorized canary confirmed outbound denial",
+        record(ACTIVE_EGRESS_CHECK, canary_ok, "authorized canary confirmed outbound denial",
                "authorized outbound denial was not confirmed",
                "Use the security acceptance runbook and its approved canary adapter.")
 

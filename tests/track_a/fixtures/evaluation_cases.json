@@ -1,0 +1,82 @@
+[
+  {
+    "case_id": "a-en-01",
+    "language": "en",
+    "scan_quality": "native",
+    "question": "Where is Ａ－１２?",
+    "expected_state": "VERIFIED",
+    "expected_label": "a-12",
+    "expected_box": [
+      0.2,
+      0.2,
+      0.18,
+      0.36
+    ]
+  },
+  {
+    "case_id": "a-ko-01",
+    "language": "ko",
+    "scan_quality": "native",
+    "question": "부품B는 어디에 있어?",
+    "expected_state": "VERIFIED",
+    "expected_label": "부품b",
+    "expected_box": [
+      0.5,
+      0.2,
+      0.18,
+      0.36
+    ],
+    "recorded_layout": "aligned"
+  },
+  {
+    "case_id": "a-ja-01",
+    "language": "ja",
+    "scan_quality": "native",
+    "question": "部品Cはどこですか？",
+    "expected_state": "VERIFIED",
+    "expected_label": "部品c",
+    "expected_box": [
+      0.8,
+      0.2,
+      0.15,
+      0.36
+    ],
+    "recorded_layout": "aligned"
+  },
+  {
+    "case_id": "a-ja-02",
+    "language": "ja",
+    "scan_quality": "native",
+    "question": "部品はどこですか？",
+    "expected_state": "PART_ABSENT",
+    "expected_label": "部品",
+    "expected_box": null
+  },
+  {
+    "case_id": "a-en-02",
+    "language": "en",
+    "scan_quality": "synthetic-duplicate",
+    "question": "Where is A-12?",
+    "expected_state": "ABSTAIN",
+    "expected_label": "a-12",
+    "expected_box": null
+  },
+  {
+    "case_id": "a-ko-03",
+    "language": "ko",
+    "scan_quality": "native",
+    "question": "부품B는 어디에 있어?",
+    "expected_state": "ABSTAIN",
+    "expected_label": "부품b",
+    "expected_box": null
+  },
+  {
+    "case_id": "a-ja-03",
+    "language": "ja",
+    "scan_quality": "native",
+    "question": "部品Cはどこですか？",
+    "expected_state": "ABSTAIN",
+    "expected_label": "部品c",
+    "expected_box": null
+  }
+]

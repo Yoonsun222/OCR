@@ -77,6 +77,22 @@ def test_omits_unproven_chart_relations(chart_workbook, formula: str) -> None:
     chart = replace(chart, series=(first,))
     _, series = workbook_evidence(workbook, (chart,), "doc-v1", "gen-1", "acl-7")
     assert {relation.role for relation in series.relations} == {EvidenceRole.LEGEND, EvidenceRole.SERIES}
+    assert series.to_dict()["metadata"]["relation_omissions"] == {
+        "value": "unsupported_native_reference",
+    }
+    assert formula not in json.dumps(series.to_dict(), ensure_ascii=False)
+
+
+def test_omission_metadata_distinguishes_reference_roles_and_absent_formulas(chart_workbook) -> None:
+    workbook, (chart,) = chart_workbook
+    series = replace(chart.series[0], title_formula=None, category_formula=" ", value_formula="Data!Named")
+    chart = replace(chart, series=(series,))
+    _, evidence = workbook_evidence(workbook, (chart,), "doc-v1", "gen-1", "acl-7")
+    assert evidence.relations == ()
+    assert evidence.to_dict()["metadata"]["relation_omissions"] == {
+        "series": "unsupported_native_reference",
+        "value": "unsupported_native_reference",
+    }
 
 
 def test_accepts_explicit_local_reference_with_quoted_sheet_name(chart_workbook) -> None:
@@ -107,3 +123,34 @@ def test_rejects_mixed_workbook_sheet_sources(chart_workbook) -> None:
     sheet = replace(workbook.sheets[0], source_hash="b" * 64)
     with pytest.raises(InvalidPackage, match="sheet evidence"):
         workbook_evidence(replace(workbook, sheets=(sheet,)), (), "doc-v1", "gen-1", "acl-7")
+
+
+@pytest.mark.parametrize(
+    ("key", "reference"), [("B3", "B2"), ("b2", "b2"), ("XFE1", "XFE1"), ("A1048577", "A1048577")],
+)
+def test_rejects_mismatched_or_noncanonical_cell_identity(chart_workbook, key: str, reference: str) -> None:
+    workbook, _ = chart_workbook
+    sheet = workbook.sheets[0]
+    sheet = replace(sheet, cells={key: replace(sheet.cells["B2"], reference=reference)})
+    with pytest.raises(InvalidPackage, match="cell"):
+        workbook_evidence(replace(workbook, sheets=(sheet,)), (), "doc-v1", "gen-1", "acl-7")
+
+
+@pytest.mark.parametrize("duplicate", ["part", "id"])
+def test_rejects_duplicate_chart_identity_even_when_series_are_disjoint(chart_workbook, duplicate: str) -> None:
+    workbook, (chart,) = chart_workbook
+    first = replace(chart, series=(chart.series[0],))
+    second = replace(chart, series=())
+    if duplicate == "part":
+        second = replace(second, chart_id="chart-2")
+    else:
+        second = replace(second, part_name="xl/charts/chart2.xml")
+    with pytest.raises(InvalidPackage, match="duplicate chart evidence"):
+        workbook_evidence(workbook, (first, second), "doc-v1", "gen-1", "acl-7")
+
+
+def test_rejects_chart_claiming_a_worksheet_part(chart_workbook) -> None:
+    workbook, (chart,) = chart_workbook
+    chart = replace(chart, part_name=workbook.sheets[0].part_name)
+    with pytest.raises(InvalidPackage, match="chart evidence"):
+        workbook_evidence(workbook, (chart,), "doc-v1", "gen-1", "acl-7")

@@ -1,5 +1,5 @@
 from dataclasses import replace
-from decimal import localcontext
+from decimal import DefaultContext, Inexact, localcontext
 
 import pytest
 
@@ -130,3 +130,26 @@ def test_conflicting_duplicate_evidence_abstains_independent_of_input_order() ->
     result = answer_query(query, (cell, conflicting))
     assert result.status == "판단 불가"
     assert result == answer_query(query, (conflicting, cell))
+
+
+def test_average_ignores_mutable_process_decimal_defaults() -> None:
+    evidence = numeric_evidence({"B2": "1", "B3": "0", "B4": "0"})
+    query = TrackBQuery("average", "sheet-1", "B2:B4")
+    expected = answer_query(query, evidence)
+    original_trap = DefaultContext.traps[Inexact]
+    try:
+        DefaultContext.traps[Inexact] = True
+        result = answer_query(query, evidence)
+    finally:
+        DefaultContext.traps[Inexact] = original_trap
+    assert expected.answer == "0.3333333333333333333333333333"
+    assert result == expected
+
+
+def test_aggregate_formats_exponents_independently_of_decimal_context() -> None:
+    evidence = numeric_evidence({"B2": "1E+200"})
+    query = TrackBQuery("sum", "sheet-1", "B2")
+    with localcontext() as context:
+        context.capitals = 0
+        result = answer_query(query, evidence)
+    assert result.answer == "1E+200"

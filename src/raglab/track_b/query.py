@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Context, Decimal, DecimalException, ROUND_HALF_EVEN, localcontext
+from decimal import (
+    Context, Decimal, DecimalException, DivisionByZero, InvalidOperation, Overflow,
+    ROUND_HALF_EVEN, localcontext,
+)
 from itertools import islice
 
 from raglab.contracts import EvidenceRegionV1, EvidenceRole, ExtractionMethod
@@ -52,7 +55,16 @@ def _aggregate(operation: str, values: list[Decimal]) -> Decimal:
     lowest_place = min(value.as_tuple().exponent for value in values)
     highest_place = max(value.adjusted() for value in values)
     precision = highest_place - lowest_place + len(str(len(values))) + 1
-    context = Context(prec=precision, rounding=ROUND_HALF_EVEN, Emin=-9999, Emax=9999)
+    context = Context(
+        prec=precision,
+        rounding=ROUND_HALF_EVEN,
+        Emin=-9999,
+        Emax=9999,
+        capitals=1,
+        clamp=0,
+        flags=[],
+        traps=[InvalidOperation, DivisionByZero, Overflow],
+    )
     with localcontext(context) as calculation:
         total = sum(islice(values, 1, None), values[0])
         if operation == "average":
@@ -129,4 +141,4 @@ def answer_query(query: TrackBQuery, evidence: tuple[EvidenceRegionV1, ...]) -> 
         answer = _aggregate(query.operation, values)
     except (DecimalException, ValueError):
         return abstain
-    return TrackBAnswer("answered", str(answer), candidates, operation)
+    return TrackBAnswer("answered", format(answer, "G"), candidates, operation)

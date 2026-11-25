@@ -42,6 +42,7 @@ class SheetObservation:
     hidden_columns: frozenset[str] = frozenset()
     auto_filter_range: str | None = None
     tables: tuple[TableObservation, ...] = ()
+    source_hash: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "cells", MappingProxyType(dict(self.cells)))

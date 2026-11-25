@@ -163,6 +163,7 @@ def parse_workbook(package: OpcPackage) -> WorkbookObservation:
     relationships = {rel.relationship_id: rel for rel in package.relationships(WORKBOOK_PART)}
     shared = _shared_strings(package, relationships)
 
+    source_hash = package.source_hash()
     sheets: list[SheetObservation] = []
     sheet_ids: set[int] = set()
     sheet_names: set[str] = set()
@@ -203,6 +204,7 @@ def parse_workbook(package: OpcPackage) -> WorkbookObservation:
             state=state,
             part_name=rel.target,
             cells=cells,
+            source_hash=source_hash,
         )
         sheets.append(parse_layout(package, sheet, sheet_root, table_ownership))
-    return WorkbookObservation(package.source_hash(), date_system, tuple(sheets))
+    return WorkbookObservation(source_hash, date_system, tuple(sheets))

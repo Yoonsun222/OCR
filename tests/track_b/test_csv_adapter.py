@@ -13,7 +13,7 @@ def test_csv_becomes_one_sheet_with_literal_a1_cells(tmp_path: Path, encoding: s
     raw = '품목,수량\r\n"A\r\nB",003\r\n=1+2,\r\n'.encode(encoding)
     path.write_bytes(raw)
     workbook = parse_csv(path)
-    assert workbook.source_hash == sha256(raw).hexdigest()
+    assert workbook.sheets[0].source_hash == workbook.source_hash == sha256(raw).hexdigest()
     assert workbook.date_system == "not_applicable"
     sheet, = workbook.sheets
     assert sheet.name == "표"

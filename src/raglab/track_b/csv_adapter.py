@@ -46,5 +46,6 @@ def parse_csv(path: Path) -> WorkbookObservation:
     except (UnicodeDecodeError, CsvError):
         raise InvalidPackage("invalid UTF-8 CSV data") from None
 
-    sheet = SheetObservation("sheet-csv-1", "csv", path.stem, "visible", path.name, cells)
-    return WorkbookObservation(sha256(raw).hexdigest(), "not_applicable", (sheet,))
+    source_hash = sha256(raw).hexdigest()
+    sheet = SheetObservation("sheet-csv-1", "csv", path.stem, "visible", path.name, cells, source_hash=source_hash)
+    return WorkbookObservation(source_hash, "not_applicable", (sheet,))

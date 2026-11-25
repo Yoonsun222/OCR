@@ -85,18 +85,28 @@ def test_decision_eligibility_depends_on_data_and_sample_size(
         for case in cases
     )
 
-    assert evaluate(
+    metrics = evaluate(
         cases, observations, dataset=dataset, power_analysis_approved=power_analysis_approved
-    ).status == expected
+    )
+    assert metrics.status == expected
+    assert metrics.security_gate_status == "NOT_RUN"
+    assert metrics.security_gate_passed is None
+    assert metrics.to_dict()["acl_leaks"] is None
 
 
 def test_security_counters_are_independent_hard_gates() -> None:
     case = EvaluationCase("c", "en", "native", "VERIFIED", "a-12", GOLD_BOX)
-    clean = EvaluationObservation("c", "VERIFIED", ("a-12",), (GOLD_BOX,), .1, 10, 0)
-    assert evaluate((case,), (clean,)).security_gate_passed
+    unprobed = EvaluationObservation("c", "VERIFIED", ("a-12",), (GOLD_BOX,), .1, 10, 0)
+    assert evaluate((case,), (unprobed,)).security_gate_status == "NOT_RUN"
+    assert evaluate((case,), (replace(unprobed, acl_leaks=1),)).security_gate_status == "FAIL"
+    clean = replace(unprobed, acl_leaks=0, outbound_events=0, tampered_artifact_loads=0)
+    assert evaluate((case,), (clean,)).security_gate_status == "PASS"
+    missing_claim_audit = replace(clean, unsupported_critical_claims=None)
+    assert evaluate((case,), (missing_claim_audit,)).security_gate_status == "NOT_RUN"
     for counter in ("acl_leaks", "outbound_events", "tampered_artifact_loads", "unsupported_critical_claims"):
         metrics = evaluate((case,), (replace(clean, **{counter: 1}),))
-        assert not metrics.security_gate_passed
+        assert metrics.security_gate_status == "FAIL"
+        assert metrics.security_gate_passed is False
         assert metrics.to_dict()[counter] == 1
 
 
@@ -124,6 +134,36 @@ def test_invalid_frozen_inputs_cannot_silently_distort_metrics() -> None:
             replace(observation, **invalid)
     with pytest.raises(ValueError):
         replace(case, expected_box=None)
+
+
+@pytest.mark.parametrize(
+    ("field", "private"),
+    [
+        ("language", "en:synthetic"),
+        ("scan_quality", "native:private"),
+        ("language", "synthetic-canary"),
+        ("scan_quality", "C:\\private\\drawing.svg"),
+        ("scan_quality", float("nan")),
+    ],
+)
+def test_slice_dimensions_reject_unapproved_values_without_echoing_them(field, private) -> None:
+    case = EvaluationCase("c", "ko", "native", "VERIFIED", "부품b", GOLD_BOX)
+    with pytest.raises(ValueError) as error:
+        replace(case, **{field: private})
+    assert str(private) not in str(error.value)
+
+
+def test_partial_claim_coverage_cannot_pass_the_security_gate() -> None:
+    cases = (
+        EvaluationCase("a", "en", "native", "ABSTAIN", "x", None),
+        EvaluationCase("b", "ja", "native", "PART_ABSENT", "x", None),
+    )
+    observations = (
+        EvaluationObservation("a", "ABSTAIN", (), (), .1, 10, 0,
+                              acl_leaks=0, outbound_events=0, tampered_artifact_loads=0),
+        EvaluationObservation("b", "PART_ABSENT", (), (), .1, 10, None),
+    )
+    assert evaluate(cases, observations).security_gate_status == "NOT_RUN"
 
 
 class RecordedOcr:
@@ -313,7 +353,7 @@ def test_recorded_multilingual_grounding_and_safety_smoke(tmp_path, monkeypatch)
     assert metrics.absent_precision == metrics.absent_recall == metrics.abstention_recall == 1.
     assert metrics.abstention_rate == pytest.approx(3 / 7)
     assert metrics.response_state_accuracy == 1.
-    assert metrics.security_gate_passed
+    assert metrics.security_gate_status == "PASS"
     report = json.dumps(metrics.to_dict(), ensure_ascii=False)
     assert all(private not in report for private in ("synthetic-private-canary", "A-12", "부품B", "部品C"))
     assert metrics.maximum_working_set_bytes > 0

@@ -8,6 +8,12 @@ from .models import Box, validate_box
 from .normalization import normalize_label
 
 State = Literal["VERIFIED", "PART_ABSENT", "ABSTAIN"]
+Language = Literal["en", "ko", "ja"]
+ScanQuality = Literal["native", "clean_scan", "degraded_scan", "synthetic-duplicate"]
+SecurityGateStatus = Literal["NOT_RUN", "PASS", "FAIL"]
+
+_LANGUAGES = ("en", "ko", "ja")
+_SCAN_QUALITIES = ("native", "clean_scan", "degraded_scan", "synthetic-duplicate")
 _STATES = ("VERIFIED", "PART_ABSENT", "ABSTAIN")
 _SECURITY_COUNTERS = (
     "acl_leaks", "outbound_events", "tampered_artifact_loads", "unsupported_critical_claims",
@@ -31,14 +37,18 @@ def _box(value: Box) -> Box:
 @dataclass(frozen=True, slots=True)
 class EvaluationCase:
     case_id: str
-    language: str
-    scan_quality: str
+    language: Language
+    scan_quality: ScanQuality
     expected_state: State
     expected_label: str
     expected_box: Box | None
 
     def __post_init__(self) -> None:
-        _require_text(self.case_id, self.language, self.scan_quality, self.expected_label)
+        _require_text(self.case_id, self.expected_label)
+        if type(self.language) is not str or self.language not in _LANGUAGES:
+            raise ValueError("unsupported evaluation language")
+        if type(self.scan_quality) is not str or self.scan_quality not in _SCAN_QUALITIES:
+            raise ValueError("unsupported evaluation scan quality")
         if self.expected_state not in _STATES:
             raise ValueError("unknown expected response state")
         if (self.expected_state == "VERIFIED") != (self.expected_box is not None):
@@ -57,10 +67,10 @@ class EvaluationObservation:
     candidate_boxes: tuple[Box, ...]
     latency_seconds: float
     peak_working_set_bytes: int
-    unsupported_critical_claims: int
-    acl_leaks: int = 0
-    outbound_events: int = 0
-    tampered_artifact_loads: int = 0
+    unsupported_critical_claims: int | None = None
+    acl_leaks: int | None = None
+    outbound_events: int | None = None
+    tampered_artifact_loads: int | None = None
 
     def __post_init__(self) -> None:
         _require_text(self.case_id)
@@ -81,10 +91,12 @@ class EvaluationObservation:
         latency = self.latency_seconds
         if type(latency) not in (float, int) or latency < 0 or not isfinite(latency):
             raise ValueError("latency must be finite and nonnegative")
-        for field in ("peak_working_set_bytes", *_SECURITY_COUNTERS):
+        if type(self.peak_working_set_bytes) is not int or self.peak_working_set_bytes < 0:
+            raise ValueError("peak working set must be a nonnegative integer")
+        for field in _SECURITY_COUNTERS:
             count = getattr(self, field)
-            if type(count) is not int or count < 0:
-                raise ValueError(f"{field} must be a nonnegative integer")
+            if count is not None and (type(count) is not int or count < 0):
+                raise ValueError(f"{field} must be a nonnegative integer or unmeasured")
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,13 +111,19 @@ class TrackAMetrics:
     p50_latency_seconds: float
     p95_latency_seconds: float
     maximum_working_set_bytes: int
-    unsupported_critical_claims: int
-    acl_leaks: int
-    outbound_events: int
-    tampered_artifact_loads: int
-    security_gate_passed: bool
+    unsupported_critical_claims: int | None
+    acl_leaks: int | None
+    outbound_events: int | None
+    tampered_artifact_loads: int | None
+    security_gate_status: SecurityGateStatus
     status: Literal["EXPLORATORY", "DECISION"]
     slices: dict[str, dict[str, int]]
+
+    @property
+    def security_gate_passed(self) -> bool | None:
+        if self.security_gate_status == "NOT_RUN":
+            return None
+        return self.security_gate_status == "PASS"
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -167,10 +185,19 @@ def evaluate(
             target_hits += any(_iou(case.expected_box, box) >= .50 for box in matching_boxes)
 
     latency = sorted(observation.latency_seconds for observation in observations)
-    totals = {
-        field: sum(getattr(observation, field) for observation in observations)
-        for field in _SECURITY_COUNTERS
-    }
+    totals: dict[str, int | None] = {}
+    coverage: dict[str, int] = {}
+    for field in _SECURITY_COUNTERS:
+        counts = [getattr(observation, field) for observation in observations]
+        measured = [count for count in counts if count is not None]
+        coverage[field] = len(measured)
+        totals[field] = sum(measured) if measured else None
+
+    security_status: SecurityGateStatus = "NOT_RUN"
+    if any(totals.values()):
+        security_status = "FAIL"
+    elif all(coverage.values()) and coverage["unsupported_critical_claims"] == len(observations):
+        security_status = "PASS"
     decision_eligible = dataset == "frozen_blind" and (len(cases) >= 150 or power_analysis_approved)
     return TrackAMetrics(
         label_recall_at_3=_ratio(label_hits, expected["VERIFIED"]),
@@ -184,7 +211,7 @@ def evaluate(
         p95_latency_seconds=latency[ceil(len(latency) * .95) - 1],
         maximum_working_set_bytes=max(observation.peak_working_set_bytes for observation in observations),
         **totals,
-        security_gate_passed=not any(totals.values()),
+        security_gate_status=security_status,
         status="DECISION" if decision_eligible else "EXPLORATORY",
         slices=slices,
     )

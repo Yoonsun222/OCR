@@ -18,7 +18,9 @@ serializing question text, candidate labels, or artifact contents.
   coverage of annotations marked `ABSTAIN`. State accuracy counts exact
   matches across all three states. A zero denominator yields 0.
 - Report the number of cases and `VERIFIED` responses for each language and
-  scan-quality combination. Latency P50 and P95 use nearest-rank
+  scan-quality combination. Supported languages are `en`, `ko`, and `ja`.
+  Scan-quality categories are `native`, `clean_scan`, `degraded_scan`, and
+  `synthetic-duplicate`. Latency P50 and P95 use nearest-rank
   percentiles of the supplied per-query observations. Report the maximum
   process peak working set supplied in the observations.
 
@@ -31,11 +33,16 @@ The calling evaluator is responsible for substantiating the dataset and any
 approval. Report production quality with document-cluster confidence
 intervals and the applicable lower-bound thresholds.
 
-The security gate fails on any observed ACL leak, outbound event, load of a
-tampered artifact, or unsupported critical claim. Supply counts from the
-required threat scenarios. A run's zero counts describe the checks actually
-performed. Production decisions also require separate approved-host evidence
-for security and performance.
+Security counters default to unmeasured and serialize as `null` when a
+category has no observations. The security gate reports `FAIL` on any
+observed ACL leak, outbound event, load of a tampered artifact, or unsupported
+critical claim. It reports `PASS` when all observed counts are zero, each
+threat category has an explicit measurement, and every query observation
+includes a critical-claim audit. Missing coverage otherwise yields
+`NOT_RUN`, including for a decision-eligible blind sample. Supply counts
+from the required threat scenarios and record their scope. A run's zero
+counts describe the checks actually performed. Production decisions also
+require separate approved-host evidence for security and performance.
 
 ## Synthetic service fixture
 

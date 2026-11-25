@@ -2,7 +2,7 @@ from dataclasses import replace
 
 import pytest
 
-from raglab.contracts import EvidenceRole
+from raglab.contracts import EvidenceRelation, EvidenceRole
 from raglab.track_a.evidence import candidate_to_evidence
 from raglab.track_b.charts import parse_workbook_charts
 from raglab.track_b.evidence import workbook_evidence
@@ -27,11 +27,21 @@ def test_visual_adapter_preserves_label_target_relation():
     assert from_track_a(replace(original, relations=()), "doc-a").relation_kinds == ()
 
 
-def test_visual_adapter_indexes_explicit_relation_metadata():
-    original = replace(evidence(metadata={"normalized_label": "A", "relation_kind": "label_targets"}), text=None)
+@pytest.mark.parametrize("reverse_relation", [False, True])
+def test_visual_adapter_requires_exact_label_to_target_link(reverse_relation):
+    candidate, provenance = _inputs()
+    original = candidate_to_evidence(candidate, provenance)
+    label, target = original.regions
+    relations = ()
+    if reverse_relation:
+        relations = (EvidenceRelation(EvidenceRole.LABEL, target.region_id, label.region_id),)
+    original = replace(
+        original, text=None, relations=relations,
+        metadata={"normalized_label": "A", "relation_kind": "label_targets"},
+    )
     record = from_track_a(original, "doc-a")
 
-    assert record.relation_kinds == ("label_targets",)
+    assert record.relation_kinds == ()
     assert record.searchable_text == "A"
     assert record.evidence is original
 
@@ -53,7 +63,9 @@ def test_chart_adapter_indexes_series_and_typed_source_range(workbook_and_charts
     assert record.evidence is original
     assert record.evidence.regions == ()
     assert record.structured_key == "'Data'!$B$2:$B$5"
-    assert record.structured_value == original.text
+    assert original.text
+    assert original.text in record.searchable_text
+    assert record.structured_value is None
     assert record.relation_kinds == ("legend", "series", "value")
     assert all(relation.target in record.searchable_text for relation in original.relations)
 

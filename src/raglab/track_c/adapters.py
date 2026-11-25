@@ -32,17 +32,12 @@ def from_track_a(evidence: EvidenceRegionV1, document_id: str) -> IndexRecord:
         and roles.get(relation.target_region_id) is EvidenceRole.TARGET
         for relation in evidence.relations
     )
-    relation_kinds = (
-        ("label_targets",)
-        if has_pair or evidence.metadata.get("relation_kind") == "label_targets"
-        else ()
-    )
     return IndexRecord(
         evidence=evidence,
         document_id=document_id,
         channel="visual",
         searchable_text=_searchable(evidence, ("normalized_label",)),
-        relation_kinds=relation_kinds,
+        relation_kinds=("label_targets",) if has_pair else (),
     )
 
 
@@ -76,7 +71,8 @@ def from_track_b(evidence: EvidenceRegionV1, document_id: str) -> IndexRecord:
         channel="structure",
         searchable_text=_searchable(evidence, ("label", "unit", "chart_title", "chart_part"), relation_text),
         structured_key=structured_key,
-        structured_value=evidence.text,
+        # A series observation carries the cached legend. Its value range is unresolved.
+        structured_value=None if evidence.role is EvidenceRole.SERIES else evidence.text,
         unit=_metadata_text(evidence, "unit"),
         relation_kinds=tuple(sorted({relation.role.value for relation in native_relations})),
     )

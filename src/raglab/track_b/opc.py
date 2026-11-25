@@ -49,15 +49,17 @@ class OpcLimits:
     max_xml_attribute_chars: int = 24 * 1024 * 1024
     max_xml_text_chars: int = 32 * 1024 * 1024
     max_container_bytes: int = 320 * 1024 * 1024
+    max_workbook_cells: int = 1_000_000
 
     def __post_init__(self) -> None:
         for limit in (
             self.max_entries, self.max_entry_bytes, self.max_total_bytes,
             self.max_xml_depth, self.max_xml_elements, self.max_xml_attributes,
             self.max_xml_attribute_chars, self.max_xml_text_chars, self.max_container_bytes,
+            self.max_workbook_cells,
         ):
             if type(limit) is not int or limit < 0:
-                raise ValueError("ZIP and XML limits must be nonnegative integers")
+                raise ValueError("ZIP, XML, and workbook limits must be nonnegative integers")
         if not math.isfinite(self.max_ratio) or self.max_ratio <= 0:
             raise ValueError("ZIP compression ratio limit must be positive and finite")
 

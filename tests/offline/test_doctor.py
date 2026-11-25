@@ -1,4 +1,5 @@
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -35,7 +36,9 @@ def context(profile="local16", egress="DENIED"):
     return doctor.DoctorContext(
         StaticSystem(ready_snapshot(profile)), StaticEgress(egress),
         BundleReport("PASS", "APR-TEST", (), "a" * 64), load_profile_config(profile),
-        doctor.VerifiedBundleEvidence("a" * 64, 0, True, 0),
+        doctor.VerifiedBundleEvidence(
+            "a" * 64, 0, True, 0, datetime.now(timezone.utc) + timedelta(minutes=5),
+        ),
     )
 
 
@@ -96,3 +99,51 @@ def test_canary_requires_verified_metadata_and_propagates_failure():
     assert report.overall_status == "BLOCK"
     assert calls == [(metadata.endpoint, metadata.approval_id)]
     assert metadata.endpoint not in repr(report)
+
+
+def test_expiring_bundle_blocks_final_pass_and_prevents_active_canary(monkeypatch):
+    baseline = context()
+    expiry = baseline.evidence.expires_at
+    now = expiry - timedelta(seconds=1)
+    calls = []
+
+    class Egress:
+        def inspect(self):
+            nonlocal now
+            now = expiry
+            return EgressPolicy("DENIED")
+
+    class Canary:
+        def verify_denied(self, endpoint, approval_id):
+            calls.append((endpoint, approval_id))
+            return True
+
+    monkeypatch.setattr(doctor, "_utc_now", lambda: now)
+    signed = replace(baseline.evidence, canary=doctor.CanaryAuthorization("https://sink.example.test", "APR-CANARY"))
+    request = doctor.CanaryRequest(True, "APR-CANARY", Canary())
+    report = doctor.run_doctor(replace(baseline, evidence=signed, canary=request, egress=Egress()))
+    assert report.overall_status == "BLOCK"
+    assert report.checks[0].status == "BLOCK"
+    assert report.bundle_approval_expires_at == expiry.isoformat()
+    assert calls == []
+
+
+def test_bundle_expiring_during_canary_blocks_final_report(monkeypatch):
+    baseline = context()
+    expiry = baseline.evidence.expires_at
+    now = expiry - timedelta(seconds=1)
+    called = False
+
+    class Canary:
+        def verify_denied(self, endpoint, approval_id):
+            nonlocal now, called
+            now, called = expiry, True
+            return True
+
+    monkeypatch.setattr(doctor, "_utc_now", lambda: now)
+    signed = replace(baseline.evidence, canary=doctor.CanaryAuthorization("https://sink.example.test", "APR-CANARY"))
+    request = doctor.CanaryRequest(True, "APR-CANARY", Canary())
+    report = doctor.run_doctor(replace(baseline, evidence=signed, canary=request))
+    assert called
+    assert report.checks[0].status == "BLOCK"
+    assert report.overall_status == "BLOCK"

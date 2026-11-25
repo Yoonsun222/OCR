@@ -117,8 +117,9 @@ def test_signed_dll_header_is_checked_without_loading(bundle, tmp_path, monkeypa
     add_artifact(bundle, "synthetic.dll", data)
 
     output = tmp_path / "reports" / "doctor.json"
-    assert invoke(bundle, output) == (0 if correct_machine else 5)
+    assert invoke(bundle, output) == 5
     report = json.loads(output.read_text(encoding="utf-8"))
     dll = next(check for check in report["checks"] if check["check_id"] == "DLL_INVENTORY")
-    assert dll["status"] == ("PASS" if correct_machine else "BLOCK")
+    assert dll["status"] == "BLOCK"
+    assert ("loader readiness remains unverified" in dll["message"]) is correct_machine
     assert "synthetic.dll" not in repr(report)

@@ -334,7 +334,7 @@ class WindowsLocalPaths:
                 close(handle)
             close(event)
 
-    def _rename_file(self, handle: int, destination: Path) -> None:
+    def _rename_file(self, handle: int, destination: Path, *, replace: bool = True) -> None:
         set_information = bind(
             self._kernel, "SetFileInformationByHandle", win.BOOL, win.HANDLE,
             ctypes.c_int, ctypes.c_void_p, win.DWORD,
@@ -344,43 +344,98 @@ class WindowsLocalPaths:
         # Win32 reads a terminating WCHAR in addition to the counted name.
         buffer = ctypes.create_string_buffer(max(ctypes.sizeof(_FileRenameInformation), offset + len(name) + 2))
         header = _FileRenameInformation.from_buffer(buffer)
-        header.replace = 1
+        header.replace = replace
         header.name_length = len(name)
         ctypes.memmove(ctypes.addressof(buffer) + offset, name, len(name))
         if not set_information(handle, _FILE_RENAME_INFO, buffer, len(buffer)):
             raise ctypes.WinError(ctypes.get_last_error())
 
-    def publish_report(
-        self, parent: PinnedPath, destination: Path, content: bytes, release_protection: Callable[[], None],
-    ) -> None:
+    def _create_owned_file(self, path: Path) -> int:
         create_file = bind(
             self._kernel, "CreateFileW", win.HANDLE, win.LPCWSTR, win.DWORD,
             win.DWORD, ctypes.c_void_p, win.DWORD, win.DWORD, win.HANDLE,
         )
-        close = bind(self._kernel, "CloseHandle", win.BOOL, win.HANDLE)
+        handle = create_file(
+            "\\\\?\\" + str(path), _GENERIC_READ | _GENERIC_WRITE | _DELETE,
+            0, None, _CREATE_NEW, _OPEN_REPARSE_POINT, None,
+        )
+        if handle == _INVALID_HANDLE:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return handle
+
+    def _write_owned_file(self, handle: int, content: bytes) -> None:
         flush = bind(self._kernel, "FlushFileBuffers", win.BOOL, win.HANDLE)
         write = bind(
             self._kernel, "WriteFile", win.BOOL, win.HANDLE, ctypes.c_void_p, win.DWORD,
             ctypes.POINTER(win.DWORD), ctypes.c_void_p,
         )
+        written = win.DWORD()
+        if not write(handle, content, len(content), ctypes.byref(written), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if written.value != len(content) or not flush(handle):
+            raise OSError("report write or flush failed")
+
+    def _discard_owned_file(self, handle: int) -> None:
         set_information = bind(
             self._kernel, "SetFileInformationByHandle", win.BOOL, win.HANDLE,
             ctypes.c_int, ctypes.c_void_p, win.DWORD,
         )
-        staged = parent.path / f".raglab-{uuid.uuid4().hex}.tmp"
-        handle = create_file(
-            "\\\\?\\" + str(staged), _GENERIC_READ | _GENERIC_WRITE | _DELETE,
-            0, None, _CREATE_NEW, _OPEN_REPARSE_POINT, None,
-        )
-        if handle == _INVALID_HANDLE:
+        delete = ctypes.c_ubyte(1)
+        if not set_information(handle, _FILE_DISPOSITION_INFO, ctypes.byref(delete), ctypes.sizeof(delete)):
             raise ctypes.WinError(ctypes.get_last_error())
+
+    def probe_file(
+        self, parent: PinnedPath, name: str, content: bytes,
+        *, staged_name: str | None = None, release_protection: Callable[[], None],
+    ) -> None:
+        # The caller holds parent and every ancestor with delete sharing denied.
+        # Exclusively create and remove by the same handle, even after a rename.
+        if not path_segment_is_safe(name) or (staged_name is not None and not path_segment_is_safe(staged_name)):
+            raise ValueError("invalid probe file name")
+        close = bind(self._kernel, "CloseHandle", win.BOOL, win.HANDLE)
+        seek = bind(self._kernel, "SetFilePointerEx", win.BOOL, win.HANDLE, ctypes.c_longlong, ctypes.c_void_p, win.DWORD)
+        read = bind(
+            self._kernel, "ReadFile", win.BOOL, win.HANDLE, ctypes.c_void_p,
+            win.DWORD, ctypes.POINTER(win.DWORD), ctypes.c_void_p,
+        )
+        destination = parent.path / name
+        handle = self._create_owned_file(parent.path / (staged_name if staged_name is not None else name))
+        try:
+            self._write_owned_file(handle, content)
+            if staged_name is not None:
+                # Rename requires write sharing on the directory. The staged
+                # file already keeps it nonempty and the new pin denies deletion.
+                with self.pin(parent.path, directory_write_sharing=True) as publishing:
+                    if publishing.info.file_id != parent.info.file_id:
+                        raise ValueError("probe parent changed")
+                    release_protection()
+                    self._rename_file(handle, destination, replace=False)
+                    if self.identity(publishing.handle).file_id != parent.info.file_id:
+                        raise ValueError("probe parent changed")
+            if str(self._canonical(handle)) != str(destination):
+                raise ValueError("probe file path did not round-trip")
+            actual = ctypes.create_string_buffer(len(content) + 1)
+            count = win.DWORD()
+            if not seek(handle, 0, None, 0) or not read(handle, actual, len(actual), ctypes.byref(count), None):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if actual.raw[:count.value] != content:
+                raise OSError("probe file read-back did not match")
+        finally:
+            try:
+                self._discard_owned_file(handle)
+            finally:
+                if not close(handle):
+                    raise ctypes.WinError(ctypes.get_last_error())
+
+    def publish_report(
+        self, parent: PinnedPath, destination: Path, content: bytes, release_protection: Callable[[], None],
+    ) -> None:
+        close = bind(self._kernel, "CloseHandle", win.BOOL, win.HANDLE)
+        staged = parent.path / f".raglab-{uuid.uuid4().hex}.tmp"
+        handle = self._create_owned_file(staged)
         published = False
         try:
-            written = win.DWORD()
-            if not write(handle, content, len(content), ctypes.byref(written), None):
-                raise ctypes.WinError(ctypes.get_last_error())
-            if written.value != len(content) or not flush(handle):
-                raise OSError("report write or flush failed")
+            self._write_owned_file(handle, content)
             with self.pin(parent.path, directory_write_sharing=True) as publishing:
                 if publishing.info.file_id != parent.info.file_id:
                     raise ValueError("report parent changed")
@@ -390,7 +445,8 @@ class WindowsLocalPaths:
                 if self.identity(publishing.handle).file_id != parent.info.file_id:
                     raise ValueError("report parent changed")
         finally:
-            if not published:
-                delete = ctypes.c_ubyte(1)
-                set_information(handle, _FILE_DISPOSITION_INFO, ctypes.byref(delete), ctypes.sizeof(delete))
-            close(handle)
+            try:
+                if not published:
+                    self._discard_owned_file(handle)
+            finally:
+                close(handle)

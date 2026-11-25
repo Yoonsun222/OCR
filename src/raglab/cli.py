@@ -128,8 +128,8 @@ def _doctor_command(
     paths = WindowsLocalPaths()
     observations: list[VerifiedBundleEvidence] = []
 
-    def observe(files, fingerprint, deadline):
-        observations.append(inspect_verified_bundle(files, fingerprint, deadline))
+    def observe(files, fingerprint, expires_at, deadline):
+        observations.append(inspect_verified_bundle(files, fingerprint, expires_at, deadline))
 
     try:
         bundle = paths.validate(args.bundle)

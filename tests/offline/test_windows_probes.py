@@ -1,6 +1,8 @@
 import json
 import os
 import subprocess
+from datetime import datetime, timezone
+from uuid import UUID
 
 import pytest
 
@@ -57,12 +59,41 @@ def test_egress_proof_requires_all_profiles_zero_allows_and_trusted_proxy(monkey
     policy.update(change)
     monkeypatch.setattr(windows, "_powershell_json", lambda _: json.loads(json.dumps(policy)))
     monkeypatch.setattr(windows, "_windows_proxy_is_direct", lambda: True)
+    monkeypatch.setattr(windows, "_machine_isolation_is_attested", lambda: True, raising=False)
     for key in windows._PROXY_VARIABLES:
         monkeypatch.delenv(key, raising=False)
     probe = windows.WindowsEgressPolicyProbe()
     assert probe.inspect().status == ("UNKNOWN" if change else "DENIED")
     monkeypatch.setenv("HTTPS_PROXY", "https://proxy.example.test:443")
     assert probe.inspect().status == "UNKNOWN"
+
+
+def test_passive_firewall_facts_are_insufficient_without_machine_attestation(monkeypatch):
+    monkeypatch.setattr(windows, "_powershell_json", lambda _: dict(
+        firewall_services_running=True, default_deny_profiles=3, enabled_outbound_allows=0,
+        active_profiles_known=True, policy_exemptions_absent=True,
+    ))
+    monkeypatch.setattr(windows, "_windows_proxy_is_direct", lambda: True)
+    monkeypatch.setattr(windows, "_machine_isolation_is_attested", lambda: False, raising=False)
+    for key in windows._PROXY_VARIABLES:
+        monkeypatch.delenv(key, raising=False)
+    assert windows.WindowsEgressPolicyProbe().inspect().status == "UNKNOWN"
+
+
+@pytest.mark.parametrize("overrides,expected", [
+    ({}, True),
+    ({"schema_version": True}, False),
+    ({"scope": "firewall-only"}, False),
+    ({"expires_at": "2030-01-01T00:00:00Z"}, False),
+    ({"expires_at": "2031-01-01T00:00:00"}, False),
+    ({"expires_at": "2031-01-01Z"}, False),
+    ({"unexpected": True}, False),
+])
+def test_machine_attestation_requires_current_full_isolation_with_strict_schema(overrides, expected):
+    policy = dict(schema_version=1, scope="full-workstation-egress-deny", expires_at="2031-01-01T00:00:00Z")
+    policy.update(overrides)
+    now = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    assert windows._isolation_attestation_valid(policy, now) is expected
 
 
 @pytest.mark.parametrize("flags,expected", [
@@ -101,3 +132,17 @@ def test_unicode_long_path_round_trip_leaves_no_derivatives(monkeypatch, tmp_pat
     assert snapshot.atomic_write_cleanup and snapshot.derivative_deleted
     for root in tmp_path.iterdir():
         assert list(root.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Native Windows filesystem smoke checks")
+@pytest.mark.parametrize("atomic", [True, False])
+def test_failed_exclusive_probe_preserves_file_added_by_another_writer(monkeypatch, tmp_path, atomic):
+    token = UUID(int=7)
+    monkeypatch.setattr(windows, "uuid4", lambda: token)
+    borrowed = tmp_path / f".raglab-doctor-{token.hex}.json"
+    borrowed.write_bytes(b"other writer owns this")
+    probe = windows.WindowsSystemProbe(load_profile_config("local16"), WindowsLocalPaths())
+    with pytest.raises(OSError):
+        probe._round_trip(tmp_path, atomic=atomic)
+    assert borrowed.read_bytes() == b"other writer owns this"
+    assert list(tmp_path.iterdir()) == [borrowed]

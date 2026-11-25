@@ -26,7 +26,7 @@ _CATALOG_FAILURE = "RAGLAB-BUNDLE-003"
 _APPROVAL_FAILURE = "RAGLAB-BUNDLE-004"
 _LICENSE_FAILURE = "RAGLAB-BUNDLE-005"
 _CONTROLS = frozenset({"manifest.json", "approval.json", "bundle.cat"})
-VerifiedPayloadObserver = Callable[[Mapping[str, PinnedPath], str, VerificationDeadline], None]
+VerifiedPayloadObserver = Callable[[Mapping[str, PinnedPath], str, datetime, VerificationDeadline], None]
 _APPROVAL_TIME = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{1,6})?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])"
@@ -374,7 +374,10 @@ def _verify_snapshot(
     ).hexdigest()
     require_unchanged()
     if observe_verified_payload is not None:
-        deadline.call(observe_verified_payload, {name: files[name] for name in payload}, generation, deadline)
+        deadline.call(
+            observe_verified_payload, {name: files[name] for name in payload},
+            generation, approval.expires_at, deadline,
+        )
         require_unchanged()
     if approval.expires_at <= datetime.now(timezone.utc):
         expired = BundleFailure(_APPROVAL_FAILURE, "approval.json", "approval expired")

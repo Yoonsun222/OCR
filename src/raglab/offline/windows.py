@@ -7,6 +7,7 @@ import sys
 from collections.abc import Callable, Mapping
 from contextlib import ExitStack
 from ctypes import wintypes as win
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -337,11 +338,11 @@ class WindowsCatalogVerifier:
 
 
 _POWERSHELL_SETUP = r"""
+$env:PSModulePath = "$PSHOME\Modules"
 $ErrorActionPreference = 'Stop'
 $WarningPreference = 'SilentlyContinue'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
-$env:PSModulePath = Join-Path $PSHOME 'Modules'
 if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) {
     throw 'Unsupported Windows PowerShell'
 }
@@ -517,6 +518,36 @@ def _windows_proxy_is_direct() -> bool:
                 free(pointer)
 
 
+def _isolation_attestation_valid(document: object, now: datetime) -> bool:
+    if not isinstance(document, dict) or document.keys() != {"schema_version", "scope", "expires_at"}:
+        return False
+    expiry = document["expires_at"]
+    if not (
+        type(document["schema_version"]) is int and document["schema_version"] == 1
+        and document["scope"] == "full-workstation-egress-deny"
+        and isinstance(expiry, str) and expiry.endswith("Z")
+    ):
+        return False
+    try:
+        expiration = datetime.strptime(expiry, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        return expiration > now
+    except ValueError:
+        return False
+
+
+def _machine_isolation_is_attested() -> bool:
+    import winreg
+
+    with winreg.OpenKey(
+        winreg.HKEY_LOCAL_MACHINE, _POLICY_KEY, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY,
+    ) as key:
+        raw, value_type = winreg.QueryValueEx(key, "IsolatedWorkstationAttestation")
+    if value_type != winreg.REG_SZ or not isinstance(raw, str) or len(raw) > 4096:
+        return False
+    document = json.loads(raw, object_pairs_hook=_unique_probe_object, parse_constant=_invalid_probe_constant)
+    return _isolation_attestation_valid(document, datetime.now(timezone.utc))
+
+
 class WindowsEgressPolicyProbe:
     def inspect(self) -> EgressPolicy:
         try:
@@ -529,8 +560,9 @@ class WindowsEgressPolicyProbe:
                 and policy.get("policy_exemptions_absent") is True
                 and not any(key.upper() in _PROXY_VARIABLES and value for key, value in os.environ.items())
                 and _windows_proxy_is_direct()
+                and _machine_isolation_is_attested()
             )
-        except (OSError, ValueError, RecursionError, subprocess.SubprocessError):
+        except (OSError, ValueError, ImportError, RecursionError, subprocess.SubprocessError):
             denied = False
         return EgressPolicy("DENIED" if denied else "UNKNOWN")
 
@@ -539,10 +571,6 @@ def _is_within(candidate: Path, protected: Path) -> bool:
     return len(candidate.parts) >= len(protected.parts) and all(
         windows_name_compare(left, right) == 0 for left, right in zip(candidate.parts, protected.parts)
     )
-
-
-def _extended(path: Path) -> Path:
-    return Path("\\\\?\\" + str(path))
 
 
 def _smoke_check(operation: Callable[[], bool]) -> bool:
@@ -573,38 +601,23 @@ class WindowsSystemProbe:
                 raise ValueError("working path collides with a protected path")
             return resolved.path
 
-    def _round_trip(self, root: Path, name: str, *, atomic: bool = False) -> bool:
-        # Only a fresh, randomly named directory and fixed synthetic bytes are used.
-        with self.paths.pin(root, create_directories=True) as directory:
+    def _round_trip(self, root: Path, *, atomic: bool = False, long_unicode: bool = False) -> bool:
+        suffix = uuid4().hex
+        name = f".raglab-doctor-{suffix}.json"
+        if long_unicode:
+            prefix = f".raglab-doctor-합성 日本語-{suffix}"
+            name = prefix + "x" * (250 - len(prefix)) + ".json"
+        stage = f".raglab-doctor-{suffix}.tmp" if atomic else None
+        with ExitStack() as locks:
+            directory = locks.enter_context(self.paths.pin(root, create_directories=True))
             if any(_is_within(directory.path, protected) for protected in self.protected):
                 raise ValueError("working path collides with a protected path")
-            scratch = directory.path / f".raglab-doctor-{uuid4().hex}"
-            _extended(scratch).mkdir()
-        candidate = scratch / name
-        data = b'{"synthetic":true}\n'
-        try:
-            if atomic:
-                with ExitStack() as locks:
-                    parent = locks.enter_context(self.paths.pin(scratch))
-                    self.paths.publish_report(parent, candidate, data, locks.close)
-            else:
-                with self.paths.pin(scratch):
-                    with _extended(candidate).open("xb") as target:
-                        target.write(data)
-                        target.flush()
-                        os.fsync(target.fileno())
-            with self.paths.pin(candidate) as reopened:
-                if reopened.read_bytes(len(data)) != data:
-                    return False
-                if not atomic and name != "probe.json" and len(str(reopened.path)) <= 260:
-                    return False
-            with self.paths.pin(scratch, directory_write_sharing=True):
-                _extended(candidate).unlink()
-                return not any(_extended(scratch).iterdir())
-        finally:
-            with self.paths.pin(scratch, directory_write_sharing=True):
-                _extended(candidate).unlink(missing_ok=True)
-            _extended(scratch).rmdir()
+            if long_unicode and len(str(directory.path / name)) <= 260:
+                return False
+            self.paths.probe_file(
+                directory, name, b'{"synthetic":true}\n', staged_name=stage, release_protection=locks.close,
+            )
+        return True
 
     def snapshot(self) -> SystemSnapshot:
         try:
@@ -620,11 +633,10 @@ class WindowsSystemProbe:
 
         writable = long_unicode = atomic = deleted = False
         if roots:
-            writable = all(_smoke_check(lambda: self._round_trip(root, "probe.json")) for root in roots)
-            long_name = "합성 日本語 " + "x" * 220 + ".json"
-            long_unicode = _smoke_check(lambda: self._round_trip(roots[0], long_name))
-            atomic = _smoke_check(lambda: self._round_trip(roots[2], "probe.json", atomic=True))
-            deleted = _smoke_check(lambda: self._round_trip(roots[0], "probe.json"))
+            writable = all(_smoke_check(lambda: self._round_trip(root)) for root in roots)
+            long_unicode = _smoke_check(lambda: self._round_trip(roots[0], long_unicode=True))
+            atomic = _smoke_check(lambda: self._round_trip(roots[2], atomic=True))
+            deleted = _smoke_check(lambda: self._round_trip(roots[0]))
         return SystemSnapshot(
             system.get("supported") is True,
             (sys.version_info.major, sys.version_info.minor),

@@ -12,6 +12,7 @@ import locale
 import msvcrt
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import platform
 import re
 import subprocess
@@ -31,7 +32,7 @@ from raglab.offline.jsonio import serialize_json
 from raglab.offline.progress import ProgressEvent
 from raglab.offline.repro import ApprovedDatasetManifest, ReproInputs, build_repro_bundle
 from raglab.offline.windows import WindowsCatalogVerifier, acceptance_host_snapshot
-from raglab.offline.windows_paths import FileIdentity, PinnedPath, WindowsLocalPaths, bind, path_segment_is_safe, system_dll
+from raglab.offline.windows_paths import PinnedPath, WindowsLocalPaths, bind, path_segment_is_safe, system_dll
 
 PATHS = WindowsLocalPaths()
 MARKER = ".raglab-install.json"
@@ -233,7 +234,7 @@ def removable(path, expected):
         close(handle)
 
 
-def discard(root, expected, members, *, resume=False):
+def discard(root, expected, members):
     """Remove the enumerated objects by handle, leaving unexpected entries in place."""
     nested = {}
     for name, info in members.items():
@@ -241,13 +242,7 @@ def discard(root, expected, members, *, resume=False):
         nested.setdefault(path.parent, []).append((path, info))
 
     def delete(path, info):
-        with ExitStack() as held:
-            try:
-                handle = held.enter_context(removable(path, info))
-            except FileNotFoundError:
-                if resume:
-                    return
-                raise
+        with removable(path, info) as handle:
             for child, child_info in nested.get(path, ()):
                 delete(child, child_info)
             PATHS._discard_owned_file(handle)
@@ -409,15 +404,14 @@ def safe_relative(value):
     )
 
 
-def read_install(root, *, allow_missing=False):
-    if check_path(root, missing=True) is None:
-        if allow_missing:
-            return None
-        raise Block()
+def read_install(root):
     value = read_json(root / MARKER)
     if (
-        value.keys() != {"schema_version", "generation_fingerprint", "owner", "profile", "files", "directories", "payload"}
-        or value["schema_version"] != 1 or not HEX.fullmatch(value["generation_fingerprint"])
+        not isinstance(value, dict)
+        or value.keys() - {"location"} != {
+            "schema_version", "generation_fingerprint", "owner", "profile", "files", "directories", "payload",
+        }
+        or value["schema_version"] not in {1, 2} or (value["schema_version"] == 2) != ("location" in value) or not HEX.fullmatch(value["generation_fingerprint"])
         or not HEX.fullmatch(value["owner"]) or value["profile"] not in PROFILE
         or not isinstance(value["files"], dict) or not isinstance(value["directories"], list)
         or not isinstance(value["payload"], list)
@@ -429,8 +423,8 @@ def read_install(root, *, allow_missing=False):
     return value
 
 
-def assert_managed_inventory(root, lock):
-    current = inventory(root)
+def assert_managed_inventory(root, lock, pinned=None):
+    current = inventory(root, pinned=pinned)
     allowed = lock["files"].keys() | set(lock["directories"]) | {MARKER, INSTALL_REPORT}
     if current.keys() - allowed:
         raise Block()
@@ -464,10 +458,28 @@ def matches(root, lock, current, payload):
     return True
 
 
-def data_owner(root, owner):
-    if read_json(root / DATA_MARKER) != {"schema_version": 1, "owner": owner}:
+def owner_location(root, data, identity):
+    return {"install": normalized(root), "data": normalized(data), "identity": removal_identity(identity)}
+
+
+def validate_location(marker, root, data, held, original):
+    if marker["schema_version"] == 1:
+        if held.path != original:
+            raise Block()
+    elif marker.get("location") != owner_location(root, data, held.info):
         raise Block()
-    current = inventory(root)
+
+
+def data_owner(held, owner, root, data):
+    marker = read_json(held.path / DATA_MARKER)
+    if not isinstance(marker, dict) or not (
+        marker == {"schema_version": 1, "owner": owner}
+        or marker.keys() == {"schema_version", "owner", "location"}
+        and marker["schema_version"] == 2 and marker["owner"] == owner
+    ):
+        raise Block()
+    validate_location(marker, root, data, held, data)
+    current = inventory(held.path, pinned=held)
     if any(name.split("/")[0] not in DATA_DIRS | DATA_FILES for name in current):
         raise Block()
     if any(name in DATA_DIRS and not info.is_directory for name, info in current.items()):
@@ -480,23 +492,55 @@ def clean_env():
             if not key.upper().startswith(("PYTHON", "PIP_", "VIRTUAL_ENV", "__PYVENV_LAUNCHER__"))}
 
 
-def command(argv, cwd, timeout=450):
-    result = subprocess.run(argv, cwd=cwd, env=clean_env(), check=False, timeout=timeout)
-    if result.returncode != 0:
-        raise Block(result.returncode if result.returncode in {2, 3, 4, 5, 6, 7} else 10)
-
-
 def staged_doctor(stage, bundle, data, profile):
-    code = (
-        "import sys; from pathlib import Path; sys.path.insert(0, sys.argv.pop(1)); "
-        "from raglab.cli import main, offline_config; "
-        "offline_config.CONFIG_DIRECTORY = Path(sys.argv.pop(1)); sys.exit(main())"
-    )
-    command([sys.executable, "-I", "-S", "-B", "-c", code, str(ROOT / "src"),
-             str(stage / "configs"), "doctor",
-             "--bundle", str(bundle), "--profile", profile, "--offline",
-             "--report", str(data / "runs" / "doctor-install.json")], data, timeout=300)
-    return read_doctor_report(data / "runs" / "doctor-install.json")
+    scratch = OwnedTree(data.parent / (".raglab-doctor-" + uuid.uuid4().hex))
+    try:
+        defaults = read_json(stage / "configs/security-defaults.json")
+        for name in ("temp_root", "cache_root", "output_root"):
+            value = defaults.get(name)
+            if not isinstance(value, str):
+                raise Block(5)
+            relative = Path(value)
+            if relative.is_absolute() or not safe_relative(relative.as_posix()):
+                raise Block(5)
+            scratch._directory(relative)
+        # The bootstrap publishes only the approved generation over the child
+        # process pipe. Doctor's filesystem probes run within owned scratch.
+        marker = "RAGLAB-INSTALL-DOCTOR="
+        code = (
+            "import sys; from pathlib import Path; sys.path.insert(0, sys.argv.pop(1)); "
+            "import raglab.cli as cli; "
+            "cli.offline_config.CONFIG_DIRECTORY = Path(sys.argv.pop(1)); "
+            f"cli._publish_report = lambda _paths, _source, _output, report: "
+            f"print({marker!r} + str(report['generation_fingerprint'])); "
+            "sys.exit(cli.main())"
+        )
+        result = subprocess.run(
+            [sys.executable, "-I", "-S", "-B", "-c", code, str(ROOT / "src"),
+             str(stage / "configs"), "doctor", "--bundle", str(bundle), "--profile", profile,
+             "--offline", "--report", str(scratch.root / "doctor-install.json")],
+            cwd=scratch.root, env=clean_env(), check=False, timeout=300,
+            stdout=subprocess.PIPE, text=True, errors="replace",
+        )
+        fingerprints = []
+        for line in result.stdout.splitlines():
+            if line.startswith(marker):
+                fingerprints.append(line.removeprefix(marker))
+            else:
+                print(line)
+        if result.returncode:
+            raise Block(result.returncode if result.returncode in {2, 3, 4, 5, 6, 7} else 10)
+        if len(fingerprints) != 1 or not HEX.fullmatch(fingerprints[0]):
+            raise Block(4)
+        return SimpleNamespace(generation_fingerprint=fingerprints[0])
+    finally:
+        primary_error = sys.exc_info()[0] is not None
+        try:
+            scratch.clean()
+        except (Block, OSError, ValueError):
+            if not primary_error:
+                raise
+            print("RAGLAB-INSTALL-003 doctor scratch requires local review", file=sys.stderr)
 
 
 def move(source, destination, info):
@@ -511,14 +555,18 @@ def install(bundle, root, data, mode, profile):
     bundle, root, data = local_input(bundle), protected_root(root), protected_root(data)
     assert_disjoint(bundle, root, data, ROOT)
     with serialized(root), serialized(data):
-        lock = read_install(root, allow_missing=True)
-        current = assert_managed_inventory(root, lock) if lock else {}
-        owner = lock["owner"] if lock else uuid.uuid4().hex * 2
-        data_info = check_path(data, missing=True)
-        if data_info is not None:
-            data_owner(data, owner)
-        elif lock:
-            raise Block()
+        with PATHS.pin(root, missing_ok=True, directory_write_sharing=True, reject_aliases=True) as installed:
+            with PATHS.pin(data, missing_ok=True, directory_write_sharing=True, reject_aliases=True) as owned:
+                old_info, data_info = installed.info, owned.info
+                lock = read_install(root) if old_info else None
+                if lock:
+                    validate_location(lock, root, data, installed, root)
+                current = assert_managed_inventory(root, lock, installed) if lock else {}
+                owner = lock["owner"] if lock else uuid.uuid4().hex * 2
+                if data_info is not None:
+                    data_owner(owned, owner, root, data)
+                elif lock:
+                    raise Block()
         stage_path = root.parent / (".raglab-build-" + uuid.uuid4().hex)
         backup = root.parent / (".raglab-backup-" + uuid.uuid4().hex)
         stage = None
@@ -533,7 +581,14 @@ def install(bundle, root, data, mode, profile):
                     Path(name).as_posix(): digest(member.stream, check=deadline.check)
                     for name, member in files.items()
                 }
-                unchanged = matches(root, lock, current, source_hashes)
+                with PATHS.pin(root, directory_write_sharing=True, reject_aliases=True) as held_root:
+                    with PATHS.pin(data, directory_write_sharing=True, reject_aliases=True) as held_data:
+                        if (
+                            held_root.info.file_id != old_info.file_id
+                            or held_data.info.file_id != data_info.file_id
+                        ):
+                            raise Block()
+                        unchanged = matches(root, lock, current, source_hashes)
             if not unchanged:
                 stage = OwnedTree(stage_path)
                 copied = copy_payload(files, stage, deadline)
@@ -545,17 +600,21 @@ def install(bundle, root, data, mode, profile):
             if unchanged:
                 print("RagLab install PASS (verified no-op)")
                 return
-            if data_info is None:
-                working = OwnedTree(data)
-                working.json(DATA_MARKER, {"schema_version": 1, "owner": owner})
             action = "Repair" if lock or mode == "Repair" else "Install"
             build_venv(stage)
             with stage.checked():
                 doctor = staged_doctor(stage.root, bundle, data, profile)
                 if doctor.generation_fingerprint != verified.generation_fingerprint:
                     raise Block(4)
+            if data_info is None:
+                working = OwnedTree(data)
+                data_info = working.info
+                working.json(DATA_MARKER, {
+                    "schema_version": 2, "owner": owner, "location": owner_location(root, data, data_info),
+                })
             new_lock = {
-                "schema_version": 1, "owner": owner, "files": dict(stage.hashes),
+                "schema_version": 2, "owner": owner, "files": dict(stage.hashes),
+                "location": owner_location(root, data, stage.info),
                 "directories": sorted(name for name, info in stage.members.items() if info.is_directory),
                 "profile": profile, "generation_fingerprint": verified.generation_fingerprint,
                 "payload": copied,
@@ -565,15 +624,17 @@ def install(bundle, root, data, mode, profile):
                 "schema_version": 1, "status": "PASS", "action": action, "profile": profile,
                 "generation_fingerprint": verified.generation_fingerprint,
             })
-            old_info = check_path(root) if lock else None
-            if old_info:
-                move(root, backup, old_info)
-            try:
-                stage.publish(root)
-            except BaseException:
+            with PATHS.pin(data, directory_write_sharing=True, reject_aliases=True) as held_data:
+                if held_data.info.file_id != data_info.file_id:
+                    raise Block()
                 if old_info:
-                    move(backup, root, old_info)
-                raise
+                    move(root, backup, old_info)
+                try:
+                    stage.publish(root)
+                except BaseException:
+                    if old_info:
+                        move(backup, root, old_info)
+                    raise
             stage = None
             working = None
             if old_info:
@@ -594,17 +655,6 @@ def removal_identity(info):
     return [info.volume, info.index.hex(), info.is_directory]
 
 
-def plan_identity(value):
-    if (
-        not isinstance(value, list) or len(value) != 3
-        or type(value[0]) is not int or not 0 <= value[0] < 2**64
-        or not isinstance(value[1], str) or not re.fullmatch(r"[0-9a-f]{32}", value[1])
-        or type(value[2]) is not bool
-    ):
-        raise Block()
-    return FileIdentity(value[0], bytes.fromhex(value[1]), 0, 0, value[2])
-
-
 def valid_install_receipt(prior, lock):
     return (
         isinstance(prior, dict) and prior.keys() == SAFE_INSTALL_RECEIPT
@@ -614,73 +664,88 @@ def valid_install_receipt(prior, lock):
     )
 
 
-def prepare_removal(root, data, receipt, policy, lock):
-    installed, working = assert_managed_inventory(root, lock), data_owner(data, lock["owner"])
-    description = {"schema_version": 1, "generation_fingerprint": lock["generation_fingerprint"],
-                   "installed_objects": len(installed), "working_objects": len(working)}
-    prior = None
-    if policy == "KeepAuditReceipts":
-        prior = read_json(root / INSTALL_REPORT)
+class RemovalRecoveryRequired(Block):
+    """The live ownership evidence no longer supports automatic removal."""
+
+
+def removal_record(root, data, root_path, data_path, policy):
+    with ExitStack() as pins:
+        installed, working = (
+            pins.enter_context(PATHS.pin(path, directory_write_sharing=True, reject_aliases=True))
+            for path in (root_path, data_path)
+        )
+        pins.enter_context(PATHS.pin(installed.path / MARKER, reject_aliases=True))
+        pins.enter_context(PATHS.pin(working.path / DATA_MARKER, reject_aliases=True))
+        lock = read_install(installed.path)
+        validate_location(lock, root, data, installed, root)
+        files = assert_managed_inventory(installed.path, lock, installed)
+        work_files = data_owner(working, lock["owner"], root, data)
+        prior = read_json(installed.path / INSTALL_REPORT)
         if not valid_install_receipt(prior, lock):
             raise Block()
-    plan = {
-        "description": description, "policy": policy, "roots": [str(root), str(data)],
-        "quarantine": [".raglab-remove-" + uuid.uuid4().hex for _ in range(2)],
-        "identities": [removal_identity(check_path(path)) for path in (root, data)],
-        "members": [{name: removal_identity(info) for name, info in members.items()}
-                    for members in (installed, working)],
-    }
-    files = {"removal-manifest.json": description, REMOVAL_PLAN: plan}
-    if prior is not None:
+        description = {
+            "schema_version": 1, "generation_fingerprint": lock["generation_fingerprint"],
+            "installed_objects": len(files), "working_objects": len(work_files),
+        }
+        identities = [removal_identity(held.info) for held in (installed, working)]
+        roots = [normalized(root), normalized(data)]
+        quarantine = []
+        for original, identity in zip(roots, identities):
+            material = json.dumps([lock["owner"], original, identity], ensure_ascii=True).encode("utf-8")
+            quarantine.append(".raglab-remove-" + hashlib.sha256(material).hexdigest()[:32])
+        plan = {
+            "description": description, "policy": policy, "roots": roots,
+            "quarantine": quarantine, "identities": identities,
+            "members": [{name: removal_identity(info) for name, info in members.items()}
+                        for members in (files, work_files)],
+        }
+        return plan, prior, ((installed.info, files), (working.info, work_files))
+
+
+def prepare_removal(root, data, receipt, policy):
+    plan, prior, snapshots = removal_record(root, data, root, data, policy)
+    files = {"removal-manifest.json": plan["description"], REMOVAL_PLAN: plan}
+    if policy == "KeepAuditReceipts":
         files[INSTALL_REPORT] = prior
     with PATHS.pin(receipt.parent, directory_write_sharing=True, reject_aliases=True) as parent:
         PATHS.publish_new_directory(parent, receipt.name, {
             name: serialize_json(value).encode("utf-8") for name, value in files.items()
         })
+    return plan, snapshots
 
 
-def removal_targets(plan, root, data, policy):
-    if (
-        not isinstance(plan, dict)
-        or plan.keys() != {"description", "policy", "roots", "quarantine", "identities", "members"}
-        or plan["roots"] != [str(root), str(data)] or plan["policy"] != policy
-        or any(not isinstance(plan[field], list) or len(plan[field]) != 2
-               for field in ("quarantine", "identities", "members"))
+def quarantine_paths(plan, root, data, receipt):
+    names = plan.get("quarantine") if isinstance(plan, dict) else None
+    if not isinstance(names, list) or len(names) != 2 or any(
+        not isinstance(name, str) or not re.fullmatch(r"\.raglab-remove-[0-9a-f]{32}", name)
+        for name in names
     ):
         raise Block()
-    description = plan["description"]
-    if (
-        not isinstance(description, dict)
-        or description.keys() != {"schema_version", "generation_fingerprint", "installed_objects", "working_objects"}
-        or description["schema_version"] != 1 or not isinstance(description["generation_fingerprint"], str)
-        or not HEX.fullmatch(description["generation_fingerprint"])
-    ):
-        raise Block()
-    targets = []
-    for original, name, identity, entries, count_key in zip(
-        (root, data), plan["quarantine"], plan["identities"], plan["members"],
-        ("installed_objects", "working_objects"),
-    ):
-        if (
-            not isinstance(name, str) or not re.fullmatch(r"\.raglab-remove-[0-9a-f]{32}", name)
-            or not isinstance(entries, dict) or len(entries) != description[count_key]
-            or not all(map(safe_relative, entries))
-        ):
-            raise Block()
-        expected = plan_identity(identity)
-        if not expected.is_directory:
-            raise Block()
-        quarantine = original.parent / name
-        members = {name: plan_identity(info) for name, info in entries.items()}
-        if any(
-            Path(name).parent != Path(".")
-            and not getattr(members.get(Path(name).parent.as_posix()), "is_directory", False)
-            for name in members
-        ):
-            raise Block()
-        targets.append((original, quarantine, expected, members))
-    assert_disjoint(*(path for original, quarantine, _, _ in targets for path in (original, quarantine)))
-    return targets
+    paths = tuple(original.parent / name for original, name in zip((root, data), names))
+    assert_disjoint(root, data, receipt, ROOT, *paths)
+    return paths
+
+
+def reauthenticate_removal(plan, root, data, receipt, policy):
+    paths = quarantine_paths(plan, root, data, receipt)
+    present = []
+    for original, quarantine in zip((root, data), paths):
+        found = [path for path in (original, quarantine) if check_path(path, missing=True) is not None]
+        if len(found) != 1:
+            raise RemovalRecoveryRequired()
+        present.append(found[0])
+    try:
+        expected, prior, snapshots = removal_record(root, data, *present, policy)
+        if expected != plan or read_json(receipt / "removal-manifest.json") != expected["description"]:
+            raise RemovalRecoveryRequired()
+        saved = receipt / INSTALL_REPORT
+        if policy == "KeepAuditReceipts" and read_json(saved) != prior:
+            raise RemovalRecoveryRequired()
+        if policy == "Purge" and check_path(saved, missing=True) is not None:
+            raise RemovalRecoveryRequired()
+    except (Block, OSError, ValueError, TypeError, KeyError) as failure:
+        raise RemovalRecoveryRequired() from failure
+    return tuple(present), snapshots
 
 
 def uninstall(root, data, policy):
@@ -688,39 +753,33 @@ def uninstall(root, data, policy):
     receipt = data.parent / (data.name + "-uninstall")
     assert_disjoint(root, data, receipt, ROOT)
     with serialized(root), serialized(data):
-        if check_path(receipt, missing=True) is None:
-            prepare_removal(root, data, receipt, policy, read_install(root))
         plan_path = receipt / REMOVAL_PLAN
-        plan_info = check_path(plan_path, missing=True)
-        if plan_info is None:
-            if check_path(root, missing=True) is None and check_path(data, missing=True) is None:
-                old = read_json(receipt / "uninstall-report.json")
-                if old.get("status") == "PASS" and old.get("negative_lookup") is True:
-                    print("RagLab uninstall PASS (verified no-op)")
-                    return
-            raise Block()
-        plan = read_json(plan_path)
-        targets = removal_targets(plan, root, data, policy)
-        for original, quarantine, expected, members in targets:
-            source, withdrawn = (check_path(path, missing=True) for path in (original, quarantine))
-            if source is not None and withdrawn is not None:
+        if check_path(receipt, missing=True) is None:
+            plan, snapshots = prepare_removal(root, data, receipt, policy)
+            present = (root, data)
+            plan_info = check_path(plan_path)
+        else:
+            with PATHS.pin(plan_path, missing_ok=True, reject_aliases=True) as held:
+                plan_info = held.info
+                if plan_info is not None:
+                    if plan_info.link_count != 1 or plan_info.is_directory:
+                        raise Block()
+                    plan = json.loads(held.read_bytes(4 * 1024 * 1024))
+            if plan_info is None:
+                if check_path(root, missing=True) is None and check_path(data, missing=True) is None:
+                    old = read_json(receipt / "uninstall-report.json")
+                    if old.get("status") == "PASS" and old.get("negative_lookup") is True:
+                        print("RagLab uninstall PASS (verified no-op)")
+                        return
                 raise Block()
-            current = source or withdrawn
-            if current is None:
-                continue
-            if current.file_id != expected.file_id or not current.is_directory:
-                raise Block()
-            current_members = inventory(original if source is not None else quarantine)
-            for name, info in current_members.items():
-                known = members.get(name)
-                if known is None or known.file_id != info.file_id or known.is_directory != info.is_directory:
-                    raise Block()
-            if source is not None:
-                move(original, quarantine, expected)
-        for _, quarantine, expected, members in targets:
-            discard(quarantine, expected, members, resume=True)
-        if any(check_path(path, missing=True) is not None
-               for original, quarantine, _, _ in targets for path in (original, quarantine)):
+            present, snapshots = reauthenticate_removal(plan, root, data, receipt, policy)
+        quarantines = quarantine_paths(plan, root, data, receipt)
+        for current, quarantine, (expected, _) in zip(present, quarantines, snapshots):
+            if current != quarantine:
+                move(current, quarantine, expected)
+        for quarantine, (expected, members) in zip(quarantines, snapshots):
+            discard(quarantine, expected, members)
+        if any(check_path(path, missing=True) is not None for path in (root, data, *quarantines)):
             raise Block()
         report(receipt / "uninstall-report.json", {
             **plan["description"], "status": "PASS", "retention_policy": policy, "negative_lookup": True,
@@ -1010,6 +1069,10 @@ def main(argv=None, *, security_canary=None):
     try:
         result = {"install": install, "uninstall": uninstall, "acceptance": acceptance}[operation](**args)
         return result or 0
+    except RemovalRecoveryRequired as failure:
+        code = failure.number
+        print("RAGLAB-UNINSTALL-003 local recovery required. See the operator offline installation guide.", file=sys.stderr)
+        return code
     except Block as failure:
         code = failure.number
     except (FileNotFoundError, PermissionError, ValueError, TypeError, KeyError):

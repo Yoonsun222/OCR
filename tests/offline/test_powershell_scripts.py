@@ -45,8 +45,9 @@ def lifecycle():
 
 
 @pytest.mark.skipif(os.name != "nt", reason="requires Windows file identity")
+@pytest.mark.parametrize("partial_removal", [False, True])
 def test_mocked_lifecycle_uses_pinned_streams_repairs_and_keeps_foreign_files(
-    lifecycle, tmp_path, monkeypatch,
+    lifecycle, tmp_path, monkeypatch, partial_removal,
 ):
     import sys
     from types import SimpleNamespace
@@ -80,6 +81,21 @@ def test_mocked_lifecycle_uses_pinned_streams_repairs_and_keeps_foreign_files(
         return SimpleNamespace(generation_fingerprint="a" * 64)
 
     monkeypatch.setitem(lifecycle, "verify_bundle", verify)
+    def blocked_doctor(argv, *, cwd, **_):
+        assert not data.exists()
+        assert cwd.name.startswith(".raglab-doctor-")
+        assert cwd.parent == data.parent
+        assert all((cwd / name).is_dir() for name in ("tmp", "cache", "runs"))
+        assert Path(argv[-1]).parent == cwd
+        return SimpleNamespace(returncode=5, stdout="BLOCK readiness")
+
+    with monkeypatch.context() as faults:
+        faults.setattr(lifecycle["subprocess"], "run", blocked_doctor)
+        with pytest.raises(lifecycle["Block"]) as failure:
+            lifecycle["install"](bundle, install, data, "Install", "local16")
+    assert failure.value.number == 5
+    assert set(tmp_path.iterdir()) == {bundle}
+
     monkeypatch.setitem(lifecycle, "staged_doctor", doctor)
     lifecycle["install"](bundle, install, data, "Install", "local16")
     assert (install / "src/raglab/cli.py").read_bytes() == expected["src/raglab/cli.py"]
@@ -91,6 +107,24 @@ def test_mocked_lifecycle_uses_pinned_streams_repairs_and_keeps_foreign_files(
     ) > 0
 
     (install / "src/raglab/cli.py").write_bytes(b"drift")
+    substituted_root = data if partial_removal else install
+    displaced = tmp_path / "displaced root"
+
+    def substitute_during_doctor(*_):
+        substituted_root.rename(displaced)
+        substituted_root.mkdir()
+        (substituted_root / "personal.txt").write_bytes(b"keep")
+        return SimpleNamespace(generation_fingerprint="a" * 64)
+
+    with monkeypatch.context() as faults:
+        faults.setitem(lifecycle, "staged_doctor", substitute_during_doctor)
+        with pytest.raises(lifecycle["Block"]):
+            lifecycle["install"](bundle, install, data, "Repair", "local16")
+    foreign = substituted_root / "personal.txt"
+    assert foreign.read_bytes() == b"keep"
+    foreign.unlink()
+    substituted_root.rmdir()
+    displaced.rename(substituted_root)
     lifecycle["install"](bundle, install, data, "Install", "local16")
     assert (install / "src/raglab/cli.py").read_bytes() == expected["src/raglab/cli.py"]
     assert called == ["doctor", "doctor"]
@@ -114,17 +148,46 @@ def test_mocked_lifecycle_uses_pinned_streams_repairs_and_keeps_foreign_files(
     foreign.unlink()
     (data / "tmp").mkdir()
     lifecycle["long_path_probe"](data)
+    prepare = lifecycle["prepare_removal"]
+
+    def substitute_after_plan(*args):
+        result = prepare(*args)
+        substituted_root.rename(displaced)
+        substituted_root.mkdir()
+        (substituted_root / "personal.txt").write_bytes(b"keep")
+        return result
+
+    with monkeypatch.context() as faults:
+        faults.setitem(lifecycle, "prepare_removal", substitute_after_plan)
+        with pytest.raises(lifecycle["Block"]):
+            lifecycle["uninstall"](install, data, "KeepAuditReceipts")
+    foreign = substituted_root / "personal.txt"
+    assert foreign.read_bytes() == b"keep"
+    assert data.is_dir()
+    foreign.unlink()
+    substituted_root.rmdir()
+    displaced.rename(substituted_root)
+
     discard = lifecycle["discard"]
 
     def interrupted(*args, **kwargs):
-        discard(*args, **kwargs)
-        raise RuntimeError("interrupted after the first quarantine was deleted")
+        if partial_removal:
+            discard(*args, **kwargs)
+        raise RuntimeError("interrupted")
 
     with monkeypatch.context() as faults:
         faults.setitem(lifecycle, "discard", interrupted)
         with pytest.raises(RuntimeError, match="interrupted"):
             lifecycle["uninstall"](install, data, "KeepAuditReceipts")
     assert not install.exists() and not data.exists()
+    if partial_removal:
+        remaining, = tmp_path.glob(".raglab-remove-*")
+        inventory = lifecycle["inventory"](remaining)
+        with pytest.raises(lifecycle["RemovalRecoveryRequired"]):
+            lifecycle["uninstall"](install, data, "KeepAuditReceipts")
+        assert lifecycle["inventory"](remaining) == inventory
+        assert not (tmp_path / "working data-uninstall/uninstall-report.json").exists()
+        return
     lifecycle["uninstall"](install, data, "KeepAuditReceipts")
     assert not list(tmp_path.glob(".raglab-remove-*"))
     assert not (tmp_path / "working data-uninstall/.removal-plan.json").exists()
@@ -270,3 +333,26 @@ def test_staging_rejects_and_does_not_adopt_foreign_member(lifecycle, tmp_path, 
     assert foreign.name == "foreign.txt"
     assert foreign.read_bytes() == b"foreign"
     assert not install.exists() and not data.exists()
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows file identity")
+def test_forged_removal_plan_cannot_authorize_foreign_tree_deletion(lifecycle, tmp_path):
+    install, data, receipt = (tmp_path / name for name in ("foreign install", "foreign data", "foreign data-uninstall"))
+    for root in (install, data, receipt):
+        root.mkdir()
+    for root in (install, data):
+        (root / "personal.txt").write_bytes(b"keep")
+    identity = lifecycle["removal_identity"]
+    check = lifecycle["check_path"]
+    lifecycle["report"](receipt / lifecycle["REMOVAL_PLAN"], {
+        "description": {"schema_version": 1, "generation_fingerprint": "a" * 64,
+                        "installed_objects": 1, "working_objects": 1},
+        "policy": "Purge",
+        "roots": [str(install), str(data)],
+        "quarantine": [".raglab-remove-" + char * 32 for char in "ab"],
+        "identities": [identity(check(root)) for root in (install, data)],
+        "members": [{"personal.txt": identity(check(root / "personal.txt"))}
+                    for root in (install, data)],
+    })
+    with pytest.raises(lifecycle["Block"]):
+        lifecycle["uninstall"](install, data, "Purge")
+    assert [(root / "personal.txt").read_bytes() for root in (install, data)] == [b"keep", b"keep"]

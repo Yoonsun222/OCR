@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from hashlib import sha256
 import math
 import os
 from pathlib import Path, PurePosixPath
 from struct import Struct, error as StructError
+from threading import RLock
 from typing import BinaryIO
 from weakref import finalize
 import xml.etree.ElementTree as ET
@@ -46,12 +48,13 @@ class OpcLimits:
     max_xml_attributes: int = 2_000_000
     max_xml_attribute_chars: int = 24 * 1024 * 1024
     max_xml_text_chars: int = 32 * 1024 * 1024
+    max_container_bytes: int = 320 * 1024 * 1024
 
     def __post_init__(self) -> None:
         for limit in (
             self.max_entries, self.max_entry_bytes, self.max_total_bytes,
             self.max_xml_depth, self.max_xml_elements, self.max_xml_attributes,
-            self.max_xml_attribute_chars, self.max_xml_text_chars,
+            self.max_xml_attribute_chars, self.max_xml_text_chars, self.max_container_bytes,
         ):
             if type(limit) is not int or limit < 0:
                 raise ValueError("ZIP and XML limits must be nonnegative integers")
@@ -224,6 +227,7 @@ class OpcPackage:
         self._stamp = stamp
         self._stream = stream
         self._archive = archive
+        self._stream_lock = RLock()
         self._close = finalize(self, resources.close)
 
     @classmethod
@@ -241,6 +245,8 @@ class OpcPackage:
                 raise InvalidPackage("input must be a regular local file")
             try:
                 stamp = _file_stamp(stream)
+                if stamp[2] > limits.max_container_bytes:
+                    raise PackageLimitExceeded("physical container exceeds size limit")
                 _validate_central_directory(stream, stamp[2], limits)
                 archive = resources.enter_context(ZipFile(stream))
                 names = cls._validate_infos(archive.infolist(), limits)
@@ -264,7 +270,30 @@ class OpcPackage:
         self.close()
 
     def close(self) -> None:
-        self._close()
+        with self._stream_lock:
+            self._close()
+
+    def source_hash(self) -> str:
+        """Hash the same pinned bytes that back the observed workbook."""
+        with self._stream_lock:
+            self._require_open()
+            try:
+                if _file_stamp(self._stream) != self._stamp:
+                    raise InvalidPackage("package changed after validation")
+                self._stream.seek(0)
+                digest = sha256()
+                remaining = self._stamp[2]
+                while remaining:
+                    chunk = self._stream.read(min(remaining, 1024 * 1024))
+                    if not chunk:
+                        raise InvalidPackage("inconsistent package size")
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+                if _file_stamp(self._stream) != self._stamp:
+                    raise InvalidPackage("package changed during hashing")
+                return digest.hexdigest()
+            except OSError:
+                raise InvalidPackage("unable to hash package") from None
 
     @staticmethod
     def _validate_infos(infos: list[ZipInfo], limits: OpcLimits) -> frozenset[str]:
@@ -305,19 +334,20 @@ class OpcPackage:
 
     @contextmanager
     def _member(self, part_name: str):
-        self._require_open()
-        if part_name not in self.names:
-            raise InvalidPackage("missing part")
-        try:
-            if _file_stamp(self._stream) != self._stamp:
-                raise InvalidPackage("package changed after validation")
-            info = self._archive.getinfo(part_name)
-            with self._archive.open(info) as part:
-                yield part, info.file_size
-            if _file_stamp(self._stream) != self._stamp:
-                raise InvalidPackage("package changed during read")
-        except (*ZIP_ERRORS, KeyError):
-            raise InvalidPackage("unable to read ZIP part") from None
+        with self._stream_lock:
+            self._require_open()
+            if part_name not in self.names:
+                raise InvalidPackage("missing part")
+            try:
+                if _file_stamp(self._stream) != self._stamp:
+                    raise InvalidPackage("package changed after validation")
+                info = self._archive.getinfo(part_name)
+                with self._archive.open(info) as part:
+                    yield part, info.file_size
+                if _file_stamp(self._stream) != self._stamp:
+                    raise InvalidPackage("package changed during read")
+            except (*ZIP_ERRORS, KeyError):
+                raise InvalidPackage("unable to read ZIP part") from None
 
     def read_bytes(self, part_name: str) -> bytes:
         with self._member(part_name) as (part, size):

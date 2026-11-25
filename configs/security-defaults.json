@@ -1,0 +1,7 @@
+{
+  "network_mode": "deny",
+  "diagnostic_content": false,
+  "temp_root": "tmp",
+  "cache_root": "cache",
+  "output_root": "runs"
+}

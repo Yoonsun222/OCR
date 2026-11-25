@@ -1,0 +1,7 @@
+{
+  "profile": "local16",
+  "max_working_set_gib": 12,
+  "interactive_concurrency": 1,
+  "rerank_candidates": 20,
+  "visual_candidates": 3
+}

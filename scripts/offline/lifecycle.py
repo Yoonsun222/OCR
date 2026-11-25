@@ -1,7 +1,7 @@
 """Standard-user Windows lifecycle, launched only from authenticated toolkit media."""
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 import ctypes
 from ctypes import wintypes
 from dataclasses import replace
@@ -9,6 +9,7 @@ from datetime import datetime
 import hashlib
 import json
 import locale
+import msvcrt
 import os
 from pathlib import Path
 import platform
@@ -17,6 +18,7 @@ import subprocess
 import sys
 import time
 import uuid
+import venv
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
@@ -28,8 +30,8 @@ from raglab.offline.demo import DemoRegion, DemoResult, read_doctor_report
 from raglab.offline.jsonio import serialize_json
 from raglab.offline.progress import ProgressEvent
 from raglab.offline.repro import ApprovedDatasetManifest, ReproInputs, build_repro_bundle
-from raglab.offline.windows import WindowsCatalogVerifier, _POWERSHELL_SETUP, _powershell_json
-from raglab.offline.windows_paths import WindowsLocalPaths, bind, path_segment_is_safe, system_dll
+from raglab.offline.windows import WindowsCatalogVerifier, acceptance_host_snapshot
+from raglab.offline.windows_paths import FileIdentity, PinnedPath, WindowsLocalPaths, bind, path_segment_is_safe, system_dll
 
 PATHS = WindowsLocalPaths()
 MARKER = ".raglab-install.json"
@@ -154,10 +156,13 @@ def report(path, value):
         PATHS.publish_report(parent, path, serialize_json(value).encode("utf-8"), lambda: None)
 
 
-def inventory(root, *, exclude=()):
+def inventory(root, pinned=None):
     """Inventory ordinary objects; reject reparse entries and multiply linked files."""
     result = {}
-    with PATHS.pin(root, directory_write_sharing=True, reject_aliases=True) as top:
+    locked = nullcontext(pinned) if pinned is not None else PATHS.pin(
+        root, directory_write_sharing=True, reject_aliases=True,
+    )
+    with locked as top:
         if not top.info.is_directory:
             raise Block()
 
@@ -168,8 +173,6 @@ def inventory(root, *, exclude=()):
                 for child in listing:
                     path = directory / child.name
                     relative = path.relative_to(root).as_posix()
-                    if relative in exclude:
-                        continue
                     if len(result) >= 16384:
                         raise Block()
                     with PATHS.pin_entry(path, directory_write_sharing=True) as entry:
@@ -183,9 +186,23 @@ def inventory(root, *, exclude=()):
     return result
 
 
-def mkdir(root):
-    with PATHS.pin(root.parent, directory_write_sharing=True, reject_aliases=True):
-        os.mkdir(native(root))
+def close_handle(handle):
+    close = bind(system_dll("kernel32.dll"), "CloseHandle", wintypes.BOOL, wintypes.HANDLE)
+    close(handle)
+
+
+def mkdir(root, expected_parent=None):
+    with PATHS.pin(root.parent, directory_write_sharing=True, reject_aliases=True) as parent:
+        if expected_parent is not None and parent.info.file_id != expected_parent.file_id:
+            raise Block()
+        handle = PATHS._create_owned_directory(parent, root.name)
+        try:
+            info = PATHS.identity(handle)
+            if PATHS._canonical(handle) != root or not info.is_directory:
+                raise Block()
+            return info
+        finally:
+            close_handle(handle)
 
 
 def owned_handle(path):
@@ -204,7 +221,10 @@ def removable(path, expected):
     close = bind(system_dll("kernel32.dll"), "CloseHandle", wintypes.BOOL, wintypes.HANDLE)
     try:
         current = PATHS.identity(handle)
-        if PATHS._canonical(handle) != path or current.file_id != expected.file_id:
+        if (
+            PATHS._canonical(handle) != path or current.file_id != expected.file_id
+            or current.is_directory != expected.is_directory
+        ):
             raise Block()
         if not current.is_directory and current.link_count != 1:
             raise Block()
@@ -213,7 +233,7 @@ def removable(path, expected):
         close(handle)
 
 
-def discard(root, expected, members):
+def discard(root, expected, members, *, resume=False):
     """Remove the enumerated objects by handle, leaving unexpected entries in place."""
     nested = {}
     for name, info in members.items():
@@ -221,7 +241,13 @@ def discard(root, expected, members):
         nested.setdefault(path.parent, []).append((path, info))
 
     def delete(path, info):
-        with removable(path, info) as handle:
+        with ExitStack() as held:
+            try:
+                handle = held.enter_context(removable(path, info))
+            except FileNotFoundError:
+                if resume:
+                    return
+                raise
             for child, child_info in nested.get(path, ()):
                 delete(child, child_info)
             PATHS._discard_owned_file(handle)
@@ -230,28 +256,151 @@ def discard(root, expected, members):
         delete(root, expected)
 
 
-def remove_staging(stage, original):
-    if info := check_path(stage, missing=True):
-        if info.file_id != original.file_id:
+class OwnedTree:
+    """Track every file and directory from its creation handle."""
+
+    def __init__(self, root):
+        self.root = root
+        self.info = mkdir(root)
+        self.members = {}
+        self.hashes = {}
+
+    def _directory(self, relative):
+        if not relative.parts:
+            return self.info
+        name = relative.as_posix()
+        if name not in self.members:
+            ancestor = self._directory(relative.parent)
+            self.members[name] = mkdir(self.root / relative, ancestor)
+        member = self.members[name]
+        if not member.is_directory:
             raise Block()
-        discard(stage, original, inventory(stage))
+        return member
+
+    def write(self, relative, *, data=None, source=None, check=lambda: None):
+        relative = Path(relative)
+        name = relative.as_posix()
+        if not safe_relative(name) or relative.is_absolute():
+            raise Block()
+        expected = self._directory(relative.parent)
+        destination = self.root / relative
+        with PATHS.pin(destination.parent, directory_write_sharing=True, reject_aliases=True) as parent:
+            if expected.file_id != parent.info.file_id:
+                raise Block()
+            handle = PATHS._create_owned_file(destination)
+            try:
+                info = PATHS.identity(handle)
+                if PATHS._canonical(handle) != destination or info.is_directory or info.link_count != 1:
+                    raise Block()
+                self.members[name] = info
+                fd = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
+                handle = None  # fd now owns the handle.
+                with os.fdopen(fd, "wb") as output:
+                    if source is not None:
+                        value = digest(source, output, check)
+                    else:
+                        output.write(data)
+                        value = hashlib.sha256(data).hexdigest()
+                    output.flush()
+                    os.fsync(output.fileno())
+                self.hashes[name] = value
+            finally:
+                if handle is not None:
+                    close_handle(handle)
+
+    def json(self, name, value):
+        self.write(name, data=serialize_json(value).encode("utf-8"))
+
+    @contextmanager
+    def checked_members(self, root):
+        with ExitStack() as pins:
+            observed = inventory(root.path, pinned=root)
+            if observed.keys() != self.members.keys():
+                raise Block()
+            for name, expected in self.members.items():
+                entry = pins.enter_context(PATHS.pin_entry(
+                    root.path / name, directory_write_sharing=True,
+                ))
+                if (
+                    str(entry.path) != str(root.path / name)
+                    or entry.info.file_id != expected.file_id
+                    or entry.info.is_directory != expected.is_directory
+                ):
+                    raise Block()
+                if not expected.is_directory and (
+                    entry.info.link_count != 1 or digest(entry.stream) != self.hashes[name]
+                ):
+                    raise Block(4)
+            yield
+
+    @contextmanager
+    def checked(self):
+        with PATHS.pin(self.root, directory_write_sharing=True, reject_aliases=True) as root:
+            if root.info.file_id != self.info.file_id:
+                raise Block()
+            with PATHS.watch_namespace(root) as unchanged, self.checked_members(root):
+                unchanged()
+                yield
+                unchanged()
+
+    def publish(self, destination):
+        if self.root.parent != destination.parent:
+            raise Block()
+        with PATHS.pin(self.root.parent, directory_write_sharing=True, reject_aliases=True):
+            with removable(self.root, self.info) as handle:
+                staged = PinnedPath(self.root, self.info, handle)
+                with PATHS.watch_namespace(staged, owned_for_rename=True) as unchanged:
+                    with self.checked_members(staged):
+                        unchanged()
+                    # Close child handles before renaming the directory. The
+                    # namespace watch stays armed until after post-rename validation.
+                    PATHS._rename_file(handle, destination, replace=False)
+                    try:
+                        with self.checked_members(PinnedPath(destination, self.info, handle)):
+                            unchanged()
+                    except BaseException:
+                        PATHS._rename_file(handle, self.root, replace=False)
+                        raise
+
+    def clean(self):
+        current = check_path(self.root, missing=True)
+        if current is None:
+            return
+        if current.file_id != self.info.file_id:
+            raise Block()
+        discard(self.root, self.info, self.members)
 
 
 def copy_payload(files, stage, deadline):
-    names = {}
     for name, member in files.items():
-        path = stage / name
-        if path.relative_to(stage).parts[0].lower() in {
+        relative = Path(name)
+        if relative.parts[0].lower() in {
             ".venv", MARKER, INSTALL_REPORT, DATA_MARKER, "tmp", "cache", "runs", "logs",
         }:
             raise Block()
-        with PATHS.pin(path.parent, directory_write_sharing=True,
-                       create_directories=True, reject_aliases=True):
-            with open(native(path), "xb") as output:
-                names[path.relative_to(stage).as_posix()] = digest(member.stream, output, deadline.check)
-    if not REQUIRED <= names.keys():
+        stage.write(relative, source=member.stream, check=deadline.check)
+    if not REQUIRED <= stage.hashes.keys():
         raise Block()
-    return names
+    return sorted(stage.hashes)
+
+
+def build_venv(stage):
+    # Windows CPython's venv uses stdlib-supplied redirectors and pyvenv.cfg.
+    # Install only the files we can create exclusively and track by handle.
+    base = Path(sys._base_executable).resolve(strict=True)
+    redirectors = Path(venv.__file__).parent / "scripts" / "nt"
+    for name in ("python.exe", "pythonw.exe"):
+        source = PATHS.validate(redirectors / name)
+        with PATHS.pin(source, reject_aliases=True) as launcher:
+            stage.write(f".venv/Scripts/{name}", source=launcher.stream)
+    config = (
+        f"home = {base.parent}\n"
+        "include-system-site-packages = false\n"
+        f"version = {platform.python_version()}\n"
+        f"executable = {base}\n"
+    )
+    stage.write(".venv/pyvenv.cfg", data=config.encode("utf-8"))
+    stage.write(".venv/Lib/site-packages/raglab-local.pth", data=b"../../../src\n")
 
 
 def safe_relative(value):
@@ -361,7 +510,7 @@ def move(source, destination, info):
 def install(bundle, root, data, mode, profile):
     bundle, root, data = local_input(bundle), protected_root(root), protected_root(data)
     assert_disjoint(bundle, root, data, ROOT)
-    with serialized(root):
+    with serialized(root), serialized(data):
         lock = read_install(root, allow_missing=True)
         current = assert_managed_inventory(root, lock) if lock else {}
         owner = lock["owner"] if lock else uuid.uuid4().hex * 2
@@ -370,14 +519,15 @@ def install(bundle, root, data, mode, profile):
             data_owner(data, owner)
         elif lock:
             raise Block()
-        stage = root.parent / (".raglab-build-" + uuid.uuid4().hex)
+        stage_path = root.parent / (".raglab-build-" + uuid.uuid4().hex)
         backup = root.parent / (".raglab-backup-" + uuid.uuid4().hex)
-        stage_info = None
-        copied = {}
+        stage = None
+        working = None
+        copied = None
         unchanged = False
 
         def observe(files, fingerprint, _expires_at, deadline):
-            nonlocal stage_info, unchanged
+            nonlocal stage, unchanged, copied
             if lock and fingerprint == lock["generation_fingerprint"] and profile == lock["profile"]:
                 source_hashes = {
                     Path(name).as_posix(): digest(member.stream, check=deadline.check)
@@ -385,9 +535,8 @@ def install(bundle, root, data, mode, profile):
                 }
                 unchanged = matches(root, lock, current, source_hashes)
             if not unchanged:
-                mkdir(stage)
-                stage_info = check_path(stage)
-                copied.update(copy_payload(files, stage, deadline))
+                stage = OwnedTree(stage_path)
+                copied = copy_payload(files, stage, deadline)
 
         try:
             verified = verify_bundle(bundle, WindowsCatalogVerifier(), observe_verified_payload=observe)
@@ -397,151 +546,193 @@ def install(bundle, root, data, mode, profile):
                 print("RagLab install PASS (verified no-op)")
                 return
             if data_info is None:
-                mkdir(data)
-                data_info = check_path(data)
-                try:
-                    report(data / DATA_MARKER, {"schema_version": 1, "owner": owner})
-                except BaseException:
-                    discard(data, data_info, {})
-                    raise
+                working = OwnedTree(data)
+                working.json(DATA_MARKER, {"schema_version": 1, "owner": owner})
             action = "Repair" if lock or mode == "Repair" else "Install"
-            success = False
-            try:
-                command([sys.executable, "-I", "-S", "-B", "-m", "venv", "--without-pip",
-                         str(stage / ".venv")], stage)
-                with open(native(stage / ".venv/Lib/site-packages/raglab-local.pth"), "xb") as stream:
-                    stream.write(b"../../../src\n")
-                interpreter = stage / ".venv/Scripts/python.exe"
-                probe = (
-                    "import importlib.util, pathlib, sys; "
-                    "package = importlib.util.find_spec('raglab'); "
-                    "sys.exit(0 if package and pathlib.Path(package.origin) == pathlib.Path(sys.argv[1]) else 10)"
-                )
-                command([str(interpreter), "-I", "-B", "-c", probe,
-                         str(stage / "src/raglab/__init__.py")], stage)
-                doctor = staged_doctor(stage, bundle, data, profile)
+            build_venv(stage)
+            with stage.checked():
+                doctor = staged_doctor(stage.root, bundle, data, profile)
                 if doctor.generation_fingerprint != verified.generation_fingerprint:
                     raise Block(4)
-                staged = inventory(stage)
-                files = {}
-                directories = []
-                for name, item in staged.items():
-                    if item.is_directory:
-                        directories.append(name)
-                    else:
-                        with PATHS.pin(stage / name, directory_write_sharing=True, reject_aliases=True) as entry:
-                            files[name] = digest(entry.stream)
-                if any(files.get(name) != expected for name, expected in copied.items()):
-                    raise Block(4)
-                new_lock = {
-                    "schema_version": 1, "owner": owner, "files": files, "directories": sorted(directories),
-                    "profile": profile, "generation_fingerprint": verified.generation_fingerprint,
-                    "payload": sorted(copied),
-                }
-                report(stage / MARKER, new_lock)
-                report(stage / INSTALL_REPORT, {
-                    "schema_version": 1, "status": "PASS", "action": action, "profile": profile,
-                    "generation_fingerprint": verified.generation_fingerprint,
-                })
-                old_info = check_path(root) if lock else None
+            new_lock = {
+                "schema_version": 1, "owner": owner, "files": dict(stage.hashes),
+                "directories": sorted(name for name, info in stage.members.items() if info.is_directory),
+                "profile": profile, "generation_fingerprint": verified.generation_fingerprint,
+                "payload": copied,
+            }
+            stage.json(MARKER, new_lock)
+            stage.json(INSTALL_REPORT, {
+                "schema_version": 1, "status": "PASS", "action": action, "profile": profile,
+                "generation_fingerprint": verified.generation_fingerprint,
+            })
+            old_info = check_path(root) if lock else None
+            if old_info:
+                move(root, backup, old_info)
+            try:
+                stage.publish(root)
+            except BaseException:
                 if old_info:
-                    move(root, backup, old_info)
-                try:
-                    move(stage, root, stage_info)
-                except BaseException:
-                    if old_info:
-                        move(backup, root, old_info)
-                    raise
-                success = True
-                if old_info:
-                    discard(backup, old_info, current)
-            finally:
-                if not lock and not success:
-                    discard(data, data_info, data_owner(data, owner))
+                    move(backup, root, old_info)
+                raise
+            stage = None
+            working = None
+            if old_info:
+                discard(backup, old_info, current)
             print(f"RagLab install PASS ({action})")
         finally:
-            if stage_info is not None and check_path(stage, missing=True) is not None:
-                remove_staging(stage, stage_info)
+            with ExitStack() as cleanup:
+                if stage is not None:
+                    cleanup.callback(stage.clean)
+                if working is not None:
+                    cleanup.callback(working.clean)
+
+
+REMOVAL_PLAN = ".removal-plan.json"
+
+
+def removal_identity(info):
+    return [info.volume, info.index.hex(), info.is_directory]
+
+
+def plan_identity(value):
+    if (
+        not isinstance(value, list) or len(value) != 3
+        or type(value[0]) is not int or not 0 <= value[0] < 2**64
+        or not isinstance(value[1], str) or not re.fullmatch(r"[0-9a-f]{32}", value[1])
+        or type(value[2]) is not bool
+    ):
+        raise Block()
+    return FileIdentity(value[0], bytes.fromhex(value[1]), 0, 0, value[2])
+
+
+def valid_install_receipt(prior, lock):
+    return (
+        isinstance(prior, dict) and prior.keys() == SAFE_INSTALL_RECEIPT
+        and prior["schema_version"] == 1 and prior["status"] == "PASS"
+        and prior["action"] in {"Install", "Repair"} and prior["profile"] == lock["profile"]
+        and prior["generation_fingerprint"] == lock["generation_fingerprint"]
+    )
+
+
+def prepare_removal(root, data, receipt, policy, lock):
+    installed, working = assert_managed_inventory(root, lock), data_owner(data, lock["owner"])
+    description = {"schema_version": 1, "generation_fingerprint": lock["generation_fingerprint"],
+                   "installed_objects": len(installed), "working_objects": len(working)}
+    prior = None
+    if policy == "KeepAuditReceipts":
+        prior = read_json(root / INSTALL_REPORT)
+        if not valid_install_receipt(prior, lock):
+            raise Block()
+    plan = {
+        "description": description, "policy": policy, "roots": [str(root), str(data)],
+        "quarantine": [".raglab-remove-" + uuid.uuid4().hex for _ in range(2)],
+        "identities": [removal_identity(check_path(path)) for path in (root, data)],
+        "members": [{name: removal_identity(info) for name, info in members.items()}
+                    for members in (installed, working)],
+    }
+    files = {"removal-manifest.json": description, REMOVAL_PLAN: plan}
+    if prior is not None:
+        files[INSTALL_REPORT] = prior
+    with PATHS.pin(receipt.parent, directory_write_sharing=True, reject_aliases=True) as parent:
+        PATHS.publish_new_directory(parent, receipt.name, {
+            name: serialize_json(value).encode("utf-8") for name, value in files.items()
+        })
+
+
+def removal_targets(plan, root, data, policy):
+    if (
+        not isinstance(plan, dict)
+        or plan.keys() != {"description", "policy", "roots", "quarantine", "identities", "members"}
+        or plan["roots"] != [str(root), str(data)] or plan["policy"] != policy
+        or any(not isinstance(plan[field], list) or len(plan[field]) != 2
+               for field in ("quarantine", "identities", "members"))
+    ):
+        raise Block()
+    description = plan["description"]
+    if (
+        not isinstance(description, dict)
+        or description.keys() != {"schema_version", "generation_fingerprint", "installed_objects", "working_objects"}
+        or description["schema_version"] != 1 or not isinstance(description["generation_fingerprint"], str)
+        or not HEX.fullmatch(description["generation_fingerprint"])
+    ):
+        raise Block()
+    targets = []
+    for original, name, identity, entries, count_key in zip(
+        (root, data), plan["quarantine"], plan["identities"], plan["members"],
+        ("installed_objects", "working_objects"),
+    ):
+        if (
+            not isinstance(name, str) or not re.fullmatch(r"\.raglab-remove-[0-9a-f]{32}", name)
+            or not isinstance(entries, dict) or len(entries) != description[count_key]
+            or not all(map(safe_relative, entries))
+        ):
+            raise Block()
+        expected = plan_identity(identity)
+        if not expected.is_directory:
+            raise Block()
+        quarantine = original.parent / name
+        members = {name: plan_identity(info) for name, info in entries.items()}
+        if any(
+            Path(name).parent != Path(".")
+            and not getattr(members.get(Path(name).parent.as_posix()), "is_directory", False)
+            for name in members
+        ):
+            raise Block()
+        targets.append((original, quarantine, expected, members))
+    assert_disjoint(*(path for original, quarantine, _, _ in targets for path in (original, quarantine)))
+    return targets
 
 
 def uninstall(root, data, policy):
     root, data = protected_root(root), protected_root(data)
-    assert_disjoint(root, data, ROOT)
     receipt = data.parent / (data.name + "-uninstall")
     assert_disjoint(root, data, receipt, ROOT)
-    with serialized(root):
-        lock = read_install(root, allow_missing=True)
-        if lock is None:
-            if check_path(data, missing=True) is None and check_path(receipt, missing=True) is not None:
+    with serialized(root), serialized(data):
+        if check_path(receipt, missing=True) is None:
+            prepare_removal(root, data, receipt, policy, read_install(root))
+        plan_path = receipt / REMOVAL_PLAN
+        plan_info = check_path(plan_path, missing=True)
+        if plan_info is None:
+            if check_path(root, missing=True) is None and check_path(data, missing=True) is None:
                 old = read_json(receipt / "uninstall-report.json")
                 if old.get("status") == "PASS" and old.get("negative_lookup") is True:
                     print("RagLab uninstall PASS (verified no-op)")
                     return
             raise Block()
-        installed, working = assert_managed_inventory(root, lock), data_owner(data, lock["owner"])
-        if check_path(receipt, missing=True) is not None:
-            raise Block()
-        mkdir(receipt)
-        description = {"schema_version": 1, "generation_fingerprint": lock["generation_fingerprint"],
-                       "installed_objects": len(installed), "working_objects": len(working)}
-        report(receipt / "removal-manifest.json", description)
-        if policy == "KeepAuditReceipts":
-            prior = read_json(root / INSTALL_REPORT)
-            if (
-                prior.keys() != SAFE_INSTALL_RECEIPT or prior["schema_version"] != 1
-                or prior["status"] != "PASS" or prior["action"] not in {"Install", "Repair"}
-                or prior["profile"] != lock["profile"]
-                or prior["generation_fingerprint"] != lock["generation_fingerprint"]
-            ):
+        plan = read_json(plan_path)
+        targets = removal_targets(plan, root, data, policy)
+        for original, quarantine, expected, members in targets:
+            source, withdrawn = (check_path(path, missing=True) for path in (original, quarantine))
+            if source is not None and withdrawn is not None:
                 raise Block()
-            report(receipt / INSTALL_REPORT, prior)
-        remove_install = root.parent / (".raglab-remove-" + uuid.uuid4().hex)
-        remove_data = data.parent / (".raglab-remove-" + uuid.uuid4().hex)
-        root_info, data_info = check_path(root), check_path(data)
-        move(root, remove_install, root_info)
-        try:
-            move(data, remove_data, data_info)
-        except BaseException:
-            move(remove_install, root, root_info)
-            raise
-        discard(remove_install, root_info, installed)
-        discard(remove_data, data_info, working)
-        gone = all(check_path(path, missing=True) is None for path in (root, data, remove_install, remove_data))
-        report(receipt / "uninstall-report.json", {
-            **description, "status": "PASS" if gone else "BLOCK",
-            "retention_policy": policy, "negative_lookup": gone,
-        })
-        if not gone:
+            current = source or withdrawn
+            if current is None:
+                continue
+            if current.file_id != expected.file_id or not current.is_directory:
+                raise Block()
+            current_members = inventory(original if source is not None else quarantine)
+            for name, info in current_members.items():
+                known = members.get(name)
+                if known is None or known.file_id != info.file_id or known.is_directory != info.is_directory:
+                    raise Block()
+            if source is not None:
+                move(original, quarantine, expected)
+        for _, quarantine, expected, members in targets:
+            discard(quarantine, expected, members, resume=True)
+        if any(check_path(path, missing=True) is not None
+               for original, quarantine, _, _ in targets for path in (original, quarantine)):
             raise Block()
+        report(receipt / "uninstall-report.json", {
+            **plan["description"], "status": "PASS", "retention_policy": policy, "negative_lookup": True,
+        })
+        with PATHS.pin(receipt, directory_write_sharing=True, reject_aliases=True):
+            with removable(plan_path, plan_info) as handle:
+                PATHS._discard_owned_file(handle)
         print("RagLab uninstall PASS")
-_VM_PROBE = _POWERSHELL_SETUP + r"""
-$os = CimCmdlets\Get-CimInstance -ClassName Win32_OperatingSystem
-$security = 'UNKNOWN'
-try {
-    $status = Defender\Get-MpComputerStatus
-    if ($status.AMRunningMode -eq 'Normal' -and $status.RealTimeProtectionEnabled) {
-        $security = 'REALTIME_ENABLED'
-    } else {
-        $security = 'INACTIVE_OR_PASSIVE'
-    }
-} catch {}
-$edr = 'UNKNOWN'
-try {
-    $sense = Microsoft.PowerShell.Management\Get-Service -Name Sense -ErrorAction Stop
-    $edr = if ($sense.Status -eq 'Running') { 'SENSE_RUNNING' } else { 'SENSE_STOPPED' }
-} catch {}
-@{
-    windows_build = $os.Version
-    supported = [bool]($os.ProductType -eq 1)
-    boot = $os.LastBootUpTime.ToUniversalTime().ToString('o')
-    defender = $security
-    edr = $edr
-} | ConvertTo-Json -Compress
-"""
 
 
 def vm_snapshot():
-    evidence = _powershell_json(_VM_PROBE)
+    evidence = acceptance_host_snapshot()
     if not evidence.get("supported") or not re.fullmatch(
         r"10\.0\.[0-9]{4,6}", evidence.get("windows_build", ""),
     ):

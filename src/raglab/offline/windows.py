@@ -360,6 +360,32 @@ $result = @{
 }
 $result | ConvertTo-Json -Compress
 """
+_ACCEPTANCE_SCRIPT = _POWERSHELL_SETUP + r"""
+$os = CimCmdlets\Get-CimInstance -ClassName Win32_OperatingSystem
+$security = 'UNKNOWN'
+try {
+    $status = Defender\Get-MpComputerStatus
+    if ($status.AMRunningMode -eq 'Normal' -and $status.RealTimeProtectionEnabled) {
+        $security = 'REALTIME_ENABLED'
+    } else {
+        $security = 'INACTIVE_OR_PASSIVE'
+    }
+} catch {}
+$edr = 'UNKNOWN'
+try {
+    $sense = Microsoft.PowerShell.Management\Get-Service -Name Sense -ErrorAction Stop
+    $edr = if ($sense.Status -eq 'Running') { 'SENSE_RUNNING' } else { 'SENSE_STOPPED' }
+} catch {}
+@{
+    windows_build = $os.Version
+    supported = [bool]($os.ProductType -eq 1)
+    boot = $os.LastBootUpTime.ToUniversalTime().ToString('o')
+    defender = $security
+    edr = $edr
+} | ConvertTo-Json -Compress
+"""
+
+
 _FIREWALL_SCRIPT = _POWERSHELL_SETUP + r"""
 $profiles = @(NetSecurity\Get-NetFirewallProfile -PolicyStore ActiveStore)
 $rules = @(NetSecurity\Get-NetFirewallRule -PolicyStore ActiveStore)
@@ -425,7 +451,7 @@ def _invalid_probe_constant(_value: str) -> None:
 
 
 def _powershell_json(script: str) -> dict[str, object]:
-    if script not in (_SYSTEM_SCRIPT, _FIREWALL_SCRIPT):
+    if script not in (_SYSTEM_SCRIPT, _FIREWALL_SCRIPT, _ACCEPTANCE_SCRIPT):
         raise ValueError("unknown local probe")
     system = _system_directory()
     powershell = system / "WindowsPowerShell" / "v1.0"
@@ -452,6 +478,10 @@ def _powershell_json(script: str) -> dict[str, object]:
     if not isinstance(document, dict):
         raise ValueError("Windows PowerShell probe returned an invalid object")
     return document
+
+
+def acceptance_host_snapshot() -> dict[str, object]:
+    return _powershell_json(_ACCEPTANCE_SCRIPT)
 
 
 class _WinHttpProxy(ctypes.Structure):

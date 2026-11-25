@@ -32,9 +32,10 @@ def test_powershell_51_parser_and_policy(name):
 
 def test_guards_and_copy_contract():
     source = (ROOT / "lifecycle.py").read_text(encoding="utf-8")
-    for token in ("observe_verified_payload=", "member.stream", "--without-pip",
+    for token in ("observe_verified_payload=", "member.stream", "include-system-site-packages = false",
                   "assert_disjoint", "pin_entry", "PENDING_REBOOT"):
         assert token in source
+
 
 @pytest.fixture
 def lifecycle():
@@ -94,6 +95,17 @@ def test_mocked_lifecycle_uses_pinned_streams_repairs_and_keeps_foreign_files(
     assert (install / "src/raglab/cli.py").read_bytes() == expected["src/raglab/cli.py"]
     assert called == ["doctor", "doctor"]
 
+    # The lock must describe every verified member to qualify for a no-op.
+    import json
+    marker = install / lifecycle["MARKER"]
+    lock = json.loads(marker.read_text(encoding="utf-8"))
+    optional = next(iter(set(lock["payload"]) - lifecycle["REQUIRED"]))
+    lock["payload"].remove(optional)
+    marker.write_text(json.dumps(lock), encoding="utf-8")
+    lifecycle["install"](bundle, install, data, "Install", "local16")
+    assert called == ["doctor", "doctor", "doctor"]
+    assert optional in lifecycle["read_json"](marker)["payload"]
+
     foreign = install / "foreign.txt"
     foreign.write_bytes(b"leave me alone")
     with pytest.raises(lifecycle["Block"]):
@@ -102,7 +114,20 @@ def test_mocked_lifecycle_uses_pinned_streams_repairs_and_keeps_foreign_files(
     foreign.unlink()
     (data / "tmp").mkdir()
     lifecycle["long_path_probe"](data)
+    discard = lifecycle["discard"]
+
+    def interrupted(*args, **kwargs):
+        discard(*args, **kwargs)
+        raise RuntimeError("interrupted after the first quarantine was deleted")
+
+    with monkeypatch.context() as faults:
+        faults.setitem(lifecycle, "discard", interrupted)
+        with pytest.raises(RuntimeError, match="interrupted"):
+            lifecycle["uninstall"](install, data, "KeepAuditReceipts")
+    assert not install.exists() and not data.exists()
     lifecycle["uninstall"](install, data, "KeepAuditReceipts")
+    assert not list(tmp_path.glob(".raglab-remove-*"))
+    assert not (tmp_path / "working data-uninstall/.removal-plan.json").exists()
     assert not install.exists() and not data.exists()
     receipt = tmp_path / "working data-uninstall/uninstall-report.json"
     assert lifecycle["read_json"](receipt)["negative_lookup"] is True
@@ -114,6 +139,7 @@ def test_protects_workspace_home_and_drive_root(lifecycle):
     for path in [Path.cwd(), Path.home(), Path(Path.cwd().anchor)]:
         with pytest.raises(lifecycle["Block"]):
             lifecycle["protected_root"](path)
+
 
 def test_canary_adapter_is_bound_to_operator_and_signed_values(lifecycle, monkeypatch, tmp_path):
     attempts = []
@@ -196,3 +222,51 @@ def test_failed_bundle_finalization_discards_stage_without_installing(lifecycle,
         lifecycle["install"](bundle, install, data, "Install", "local16")
     assert failure.value.number == 4
     assert set(tmp_path.iterdir()) == {bundle}
+
+@pytest.mark.skipif(os.name != "nt", reason="requires the Windows native acceptance probe")
+def test_windows_acceptance_probe_runs_through_native_powershell(lifecycle):
+    snapshot = lifecycle["vm_snapshot"]()
+    assert snapshot["windows_build"].startswith("10.0.")
+    assert snapshot["boot"].endswith("Z")
+    assert snapshot["defender"] in {"UNKNOWN", "REALTIME_ENABLED", "INACTIVE_OR_PASSIVE"}
+    assert snapshot["edr"] in {"UNKNOWN", "SENSE_RUNNING", "SENSE_STOPPED"}
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows file identity")
+def test_staging_rejects_and_does_not_adopt_foreign_member(lifecycle, tmp_path, monkeypatch):
+    from contextlib import ExitStack
+    from types import SimpleNamespace
+
+    bundle, install, data = (tmp_path / name for name in ("bundle", "install", "data"))
+    bundle.mkdir()
+    for name in lifecycle["REQUIRED"]:
+        path = bundle / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"synthetic")
+
+    def verify(source, _verifier, *, observe_verified_payload):
+        with ExitStack() as pins:
+            payload = {name: pins.enter_context(lifecycle["PATHS"].pin(source / name))
+                       for name in lifecycle["REQUIRED"]}
+            observe_verified_payload(payload, "a" * 64, None, SimpleNamespace(check=lambda: None))
+        return lifecycle["BundleReport"]("PASS", "APR-TEST", (), "a" * 64)
+
+    original = lifecycle["build_venv"]
+
+    def contaminated(stage):
+        original(stage)
+        (stage.root / "foreign.txt").write_bytes(b"foreign")
+
+    def unexpected_doctor(*_args):
+        pytest.fail("doctor ran before stage validation")
+
+    monkeypatch.setitem(lifecycle, "verify_bundle", verify)
+    monkeypatch.setitem(lifecycle, "build_venv", contaminated)
+    monkeypatch.setitem(lifecycle, "staged_doctor", unexpected_doctor)
+    with pytest.raises((lifecycle["Block"], OSError)):
+        lifecycle["install"](bundle, install, data, "Install", "local16")
+    stage, = tmp_path.glob(".raglab-build-*")
+    foreign, = stage.iterdir()
+    assert foreign.name == "foreign.txt"
+    assert foreign.read_bytes() == b"foreign"
+    assert not install.exists() and not data.exists()

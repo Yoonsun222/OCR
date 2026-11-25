@@ -214,3 +214,49 @@ def test_fusion_validates_runtime_input(field, value):
 def test_search_hit_requires_index_record():
     with pytest.raises(ValueError, match="record"):
         SearchHit(evidence(), 0.0, 1)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("answer", "Retain the protected result.", "answer"),
+        ("evidence", (evidence(),), "evidence"),
+        ("reason_code", "PROTECTED_POLICY_DETAILS", "reason_code"),
+        ("diagnostics", {"candidate_count": 1}, "diagnostics"),
+    ],
+)
+def test_authorization_changed_rejects_payload(field, value, message):
+    response = MixedResponse(
+        ResponseState.AUTHORIZATION_CHANGED,
+        "권한이 변경되어 결과를 폐기했습니다.",
+        (),
+        "AUTHORIZATION_CHANGED",
+    )
+    with pytest.raises(ValueError, match=message):
+        replace(response, **{field: value})
+
+
+def test_no_evidence_response_rejects_evidence():
+    response = MixedResponse(
+        ResponseState.NO_EVIDENCE, "근거를 찾지 못했습니다.", (), "NO_AUTHORIZED_EVIDENCE",
+    )
+    with pytest.raises(ValueError, match="evidence"):
+        replace(response, evidence=(evidence(),))
+
+
+def test_verified_response_requires_evidence():
+    with pytest.raises(ValueError, match="evidence"):
+        MixedResponse(ResponseState.VERIFIED, "12.5 MPa", (), "EXTRACTIVE_EVIDENCE")
+
+
+@pytest.mark.parametrize("state", [ResponseState.ABSTAIN, ResponseState.CONFLICT])
+def test_abstain_and_conflict_can_cite_authorized_evidence(state):
+    item = evidence()
+    response = MixedResponse(state, "Review the evidence.", (item,), state.value)
+    assert response.evidence == (item,)
+
+
+@pytest.mark.parametrize("has_conflict, keys", [(True, ()), (False, ("Pressure",))])
+def test_fusion_rejects_inconsistent_conflict_details(has_conflict, keys):
+    with pytest.raises(ValueError, match="conflict"):
+        FusionResult((candidate(),), has_conflict, keys)

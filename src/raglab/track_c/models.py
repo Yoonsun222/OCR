@@ -15,6 +15,7 @@ from raglab.security.authorization import QueryPin
 Channel = Literal["text", "structure", "visual"]
 _CHANNELS = ("text", "structure", "visual")
 _MAX_EVIDENCE = 3
+_AUTHORIZATION_CHANGED_ANSWER = "권한이 변경되어 결과를 폐기했습니다."
 _T = TypeVar("_T")
 
 
@@ -210,6 +211,8 @@ class FusionResult:
         if type(self.has_conflict) is not bool:
             raise ValueError("has_conflict must be a boolean")
         keys = _typed_tuple(self.conflict_keys, str, "conflict_keys")
+        if self.has_conflict != bool(keys):
+            raise ValueError("has_conflict must match the presence of conflict keys")
         object.__setattr__(self, "candidates", candidates)
         object.__setattr__(self, "conflict_keys", keys)
 
@@ -236,5 +239,16 @@ class MixedResponse:
         diagnostics = dict(self.diagnostics)
         if any(not isinstance(key, str) or type(value) is not int for key, value in diagnostics.items()):
             raise ValueError("diagnostics must map string keys to integer values")
+        if self.state is ResponseState.AUTHORIZATION_CHANGED:
+            if self.answer != _AUTHORIZATION_CHANGED_ANSWER:
+                raise ValueError("AUTHORIZATION_CHANGED requires the generic answer")
+            if self.reason_code != self.state.value:
+                raise ValueError("AUTHORIZATION_CHANGED requires the generic reason_code")
+            if evidence or diagnostics:
+                raise ValueError("AUTHORIZATION_CHANGED requires empty evidence and diagnostics")
+        elif self.state is ResponseState.NO_EVIDENCE and evidence:
+            raise ValueError("NO_EVIDENCE requires empty evidence")
+        elif self.state is ResponseState.VERIFIED and not evidence:
+            raise ValueError("VERIFIED requires evidence")
         object.__setattr__(self, "evidence", evidence)
         object.__setattr__(self, "diagnostics", MappingProxyType(diagnostics))

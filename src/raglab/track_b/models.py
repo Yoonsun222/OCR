@@ -52,3 +52,25 @@ class WorkbookObservation:
     source_hash: str
     date_system: str
     sheets: tuple[SheetObservation, ...]
+
+
+@dataclass(frozen=True)
+class ChartSeriesObservation:
+    index: int
+    order: int
+    legend_text: str | None
+    title_formula: str | None
+    category_formula: str | None
+    value_formula: str | None
+
+
+@dataclass(frozen=True)
+class ChartObservation:
+    chart_id: str
+    sheet_stable_id: str
+    part_name: str
+    chart_type: str
+    title: str | None
+    series: tuple[ChartSeriesObservation, ...]
+    source_hash: str
+    sheet_part_name: str

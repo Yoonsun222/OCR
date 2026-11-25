@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 500">
+  <rect data-region-id="part-a" data-kind="part" x="200" y="100" width="180" height="180" />
+  <rect data-region-id="part-b" data-kind="part" x="500" y="100" width="180" height="180" />
+  <rect data-region-id="part-c" data-kind="part" x="800" y="100" width="150" height="180" />
+</svg>

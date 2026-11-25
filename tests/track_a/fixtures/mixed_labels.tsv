@@ -1,0 +1,5 @@
+level	page_num	block_num	par_num	line_num	word_num	left	top	width	height	conf	text
+5	1	1	1	1	1	100	100	80	20	96	A-12
+5	1	1	1	2	1	410	100	90	20	94	부품B
+5	1	1	1	3	1	710	100	90	20	92	部品C
+4	1	1	1	4	0	0	0	1000	500	-1	synthetic line
